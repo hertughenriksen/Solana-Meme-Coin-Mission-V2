@@ -1,8 +1,0 @@
-# Autoresearch service dependencies
-# Install with: pip install -r ml/autoresearch/requirements.txt
-
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
-anthropic>=0.28.0
-psycopg2-binary>=2.9.9
-pydantic>=2.7.0
