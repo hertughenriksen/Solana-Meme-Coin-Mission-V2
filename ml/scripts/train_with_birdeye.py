@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import requests
 import json
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 import warnings
@@ -26,6 +27,34 @@ log = logging.getLogger(__name__)
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "cc26595c7d3f433e9604c2ef7c1b4cda")
 BIRDEYE_BASE_URL = "https://public-api.birdeye.so"
 
+# Rate limiting: 60 requests per minute = 1 request per second
+RATE_LIMIT_REQUESTS = 60
+RATE_LIMIT_SECONDS = 60
+MIN_REQUEST_INTERVAL = RATE_LIMIT_SECONDS / RATE_LIMIT_REQUESTS  # 1 second between requests
+
+# Track last request time
+last_request_time = 0
+
+def rate_limited_request(url, **kwargs):
+    """Make rate-limited API request"""
+    global last_request_time
+    
+    # Calculate time since last request
+    current_time = time.time()
+    time_since_last = current_time - last_request_time
+    
+    # Sleep if necessary to respect rate limit
+    if time_since_last < MIN_REQUEST_INTERVAL:
+        sleep_time = MIN_REQUEST_INTERVAL - time_since_last
+        log.debug(f"Rate limiting: sleeping {sleep_time:.2f}s")
+        time.sleep(sleep_time)
+    
+    # Update last request time
+    last_request_time = time.time()
+    
+    # Make the request
+    return requests.get(url, **kwargs)
+
 def fetch_token_list(limit=100):
     """Fetch top tokens from Birdeye API"""
     log.info(f"Fetching top {limit} tokens from Birdeye API...")
@@ -40,7 +69,7 @@ def fetch_token_list(limit=100):
     headers = {"X-API-Key": BIRDEYE_API_KEY}
     
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = rate_limited_request(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         
@@ -62,7 +91,7 @@ def fetch_token_info(mint):
     headers = {"X-API-Key": BIRDEYE_API_KEY}
     
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = rate_limited_request(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         return resp.json().get("data", {})
     except Exception as e:
@@ -81,7 +110,7 @@ def fetch_token_price_history(mint, days=7):
     headers = {"X-API-Key": BIRDEYE_API_KEY}
     
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = rate_limited_request(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         items = resp.json().get("data", {}).get("items", [])
         return items
