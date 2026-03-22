@@ -1,11 +1,4 @@
 /// db/postgres.rs
-///
-/// DATA-COLLECTION BUILD additions:
-///   - write_token_detection()  — upserts a full token row with all
-///     on-chain fields populated at detection time so outcome_tracker
-///     can label it later.
-///   - write_price_candle()     — previously dead-code; now called by
-///     price_feed every 2 s so the model has candle history to train on.
 use anyhow::Result;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::info;
@@ -30,13 +23,20 @@ impl Database {
         Ok(())
     }
 
-    // ── Training-data write ───────────────────────────────────────────────────
+    // ── Training-data writes ──────────────────────────────────────────────────
 
-    /// Called immediately when a new token signal is detected.
-    /// Writes every available on-chain field so outcome_tracker.py
-    /// can later compute a label from price_candles_2s.
+    /// Upserts a token row with all detection-time fields populated.
+    /// Called BEFORE the filter so even rejected tokens get a row —
+    /// those are the negative-class training examples.
     pub async fn write_token_detection(&self, signal: &TokenSignal) -> Result<()> {
         let Some(ref d) = signal.on_chain else { return Ok(()); };
+
+        let buy_sell_ratio = if (d.buy_count_1h + d.sell_count_1h) > 0 {
+            d.buy_count_1h as f64 / (d.buy_count_1h + d.sell_count_1h) as f64
+        } else {
+            0.5
+        };
+
         sqlx::query!(
             r#"INSERT INTO tokens (
                 mint,
@@ -54,9 +54,6 @@ impl Database {
                 top_10_holder_pct,
                 liquidity_usd_at_detection,
                 market_cap_usd_at_detection,
-                sniper_concentration_pct,
-                dev_holding_pct,
-                lp_lock_days,
                 buy_sell_ratio_at_detection,
                 price_usd_at_detection,
                 updated_at
@@ -66,7 +63,6 @@ impl Database {
                 $7, $8, $9, $10,
                 $11::float8, $12::float8, $13::float8,
                 $4::float8, $5::float8,
-                $12::float8, $11::float8, $10,
                 $14::float8, $15::float8,
                 NOW()
             )
@@ -100,18 +96,14 @@ impl Database {
             d.dev_holding_pct,
             d.sniper_concentration_pct,
             d.top_10_holder_pct,
-            // buy_sell_ratio_at_detection
-            if (d.buy_count_1h + d.sell_count_1h) > 0 {
-                d.buy_count_1h as f64 / (d.buy_count_1h + d.sell_count_1h) as f64
-            } else { 0.5 },
+            buy_sell_ratio,
             d.price_usd,
         ).execute(&self.pool).await?;
         Ok(())
     }
 
-    /// Write a single 2-second price candle for a token.
-    /// This was previously #[allow(dead_code)] and never called.
-    /// Now called by PriceFeed::tick() for every open position + SOL.
+    /// Writes a 2-second price candle to PostgreSQL.
+    /// Called by PriceFeed every tick so outcome_tracker can label tokens.
     pub async fn write_price_candle(&self, mint: &str, candle: &Candle) -> Result<()> {
         sqlx::query!(
             r#"INSERT INTO price_candles_2s
@@ -132,7 +124,7 @@ impl Database {
         Ok(())
     }
 
-    // ── Existing methods (unchanged) ─────────────────────────────────────────
+    // ── Existing methods ──────────────────────────────────────────────────────
 
     pub async fn insert_trade(&self, trade: &Trade) -> Result<()> {
         sqlx::query!(
