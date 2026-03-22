@@ -1,3 +1,9 @@
+// system_program::id() is deprecated in solana-sdk 2.0 in favour of
+// solana_system_interface::program::id().  We suppress the lint here because
+// changing the import would require adding a new crate dependency, and the
+// function still works correctly at runtime.
+#![allow(deprecated)]
+
 use anyhow::Result;
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_sdk::{
@@ -57,11 +63,9 @@ pub fn build_pump_fun_buy(
     let sol_usd   = sol_lamports as f64 / 1e9 * sol_price_usd;
     let token_amt = ((sol_usd / token_price_usd.max(1e-12)) * 1e6) as u64;
     let max_sol   = sol_lamports + (sol_lamports * slippage_bps as u64) / 10_000;
-
     let args = PumpFunBuyArgs { amount: token_amt, max_sol_cost: max_sol };
-    let mut data = vec![102u8, 6, 61, 18, 1, 218, 235, 234]; // buy discriminator
+    let mut data = vec![102u8, 6, 61, 18, 1, 218, 235, 234];
     data.extend_from_slice(&borsh::to_vec(&args)?);
-
     Ok(Instruction {
         program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID)?,
         accounts: vec![
@@ -91,11 +95,9 @@ pub fn build_pump_fun_sell(
     let token_usd    = token_amount as f64 / 1e6 * token_price_usd;
     let expected_sol = (token_usd / sol_price_usd.max(1e-6) * 1e9) as u64;
     let min_sol      = expected_sol.saturating_sub((expected_sol * slippage_bps as u64) / 10_000);
-
     let args = PumpFunSellArgs { amount: token_amount, min_sol_output: min_sol };
-    let mut data = vec![51u8, 230, 133, 164, 1, 127, 131, 173]; // sell discriminator
+    let mut data = vec![51u8, 230, 133, 164, 1, 127, 131, 173];
     data.extend_from_slice(&borsh::to_vec(&args)?);
-
     Ok(Instruction {
         program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID)?,
         accounts: vec![
@@ -129,15 +131,10 @@ pub fn derive_pump_fun_bonding_curve(mint: &Pubkey) -> (Pubkey, u8) {
 pub struct RaydiumCpmmSwapArgs { pub amount_in: u64, pub minimum_amount_out: u64 }
 
 pub struct CpmmPoolAccounts {
-    pub pool_id: Pubkey,
-    pub pool_authority: Pubkey,
-    pub pool_state: Pubkey,
-    pub token0_mint: Pubkey,
-    pub token1_mint: Pubkey,
-    pub token0_vault: Pubkey,
-    pub token1_vault: Pubkey,
-    pub lp_mint: Pubkey,
-    pub observation_key: Pubkey,
+    pub pool_id: Pubkey, pub pool_authority: Pubkey, pub pool_state: Pubkey,
+    pub token0_mint: Pubkey, pub token1_mint: Pubkey,
+    pub token0_vault: Pubkey, pub token1_vault: Pubkey,
+    pub lp_mint: Pubkey, pub observation_key: Pubkey,
 }
 
 pub fn build_raydium_cpmm_swap(
@@ -149,14 +146,11 @@ pub fn build_raydium_cpmm_swap(
     } else {
         (pool.token1_mint, pool.token0_mint, pool.token1_vault, pool.token0_vault)
     };
-
     let user_in  = get_associated_token_address(user, &input_mint);
     let user_out = get_associated_token_address(user, &output_mint);
-
     let args = RaydiumCpmmSwapArgs { amount_in, minimum_amount_out };
-    let mut data = vec![143u8, 190, 90, 218, 196, 30, 51, 222]; // swapBaseInput discriminator
+    let mut data = vec![143u8, 190, 90, 218, 196, 30, 51, 222];
     data.extend_from_slice(&borsh::to_vec(&args)?);
-
     Ok(Instruction {
         program_id: Pubkey::from_str(RAYDIUM_CPMM_PROGRAM_ID)?,
         accounts: vec![
@@ -181,45 +175,28 @@ pub fn build_raydium_cpmm_swap(
 
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct RaydiumAmmSwapArgs {
-    pub instruction: u8,
-    pub amount_in: u64,
-    pub minimum_amount_out: u64,
+    pub instruction: u8, pub amount_in: u64, pub minimum_amount_out: u64,
 }
 
 pub struct AmmV4PoolAccounts {
-    pub amm_id: Pubkey,
-    pub amm_authority: Pubkey,
-    pub amm_open_orders: Pubkey,
-    pub amm_target_orders: Pubkey,
-    pub pool_coin_token_account: Pubkey,
-    pub pool_pc_token_account: Pubkey,
-    pub serum_program_id: Pubkey,
-    pub serum_market: Pubkey,
-    pub serum_bids: Pubkey,
-    pub serum_asks: Pubkey,
-    pub serum_event_queue: Pubkey,
-    pub serum_coin_vault: Pubkey,
-    pub serum_pc_vault: Pubkey,
-    pub serum_vault_signer: Pubkey,
-    pub base_mint: Pubkey,
-    pub quote_mint: Pubkey,
+    pub amm_id: Pubkey, pub amm_authority: Pubkey, pub amm_open_orders: Pubkey,
+    pub amm_target_orders: Pubkey, pub pool_coin_token_account: Pubkey,
+    pub pool_pc_token_account: Pubkey, pub serum_program_id: Pubkey,
+    pub serum_market: Pubkey, pub serum_bids: Pubkey, pub serum_asks: Pubkey,
+    pub serum_event_queue: Pubkey, pub serum_coin_vault: Pubkey,
+    pub serum_pc_vault: Pubkey, pub serum_vault_signer: Pubkey,
+    pub base_mint: Pubkey, pub quote_mint: Pubkey,
 }
 
 pub fn build_raydium_amm_swap(
     pool: &AmmV4PoolAccounts, user: &Pubkey,
     amount_in: u64, minimum_amount_out: u64, is_buy: bool,
 ) -> Result<Instruction> {
-    let (source_mint, dest_mint) = if is_buy {
-        (pool.quote_mint, pool.base_mint)
-    } else {
-        (pool.base_mint, pool.quote_mint)
-    };
+    let (source_mint, dest_mint) = if is_buy { (pool.quote_mint, pool.base_mint) } else { (pool.base_mint, pool.quote_mint) };
     let src  = get_associated_token_address(user, &source_mint);
     let dest = get_associated_token_address(user, &dest_mint);
-
     let args = RaydiumAmmSwapArgs { instruction: 9, amount_in, minimum_amount_out };
     let data = borsh::to_vec(&args)?;
-
     Ok(Instruction {
         program_id: Pubkey::from_str(RAYDIUM_AMM_PROGRAM_ID)?,
         accounts: vec![
@@ -238,9 +215,9 @@ pub fn build_raydium_amm_swap(
             AccountMeta::new(pool.serum_coin_vault,         false),
             AccountMeta::new(pool.serum_pc_vault,           false),
             AccountMeta::new_readonly(pool.serum_vault_signer, false),
-            AccountMeta::new(src,    false),
-            AccountMeta::new(dest,   false),
-            AccountMeta::new(*user,  true),
+            AccountMeta::new(src,   false),
+            AccountMeta::new(dest,  false),
+            AccountMeta::new(*user, true),
         ],
         data,
     })
@@ -265,7 +242,6 @@ pub fn wrap_sol_instructions(user: &Pubkey, lamports: u64) -> Result<Vec<Instruc
     let wsol          = Pubkey::from_str(WSOL_MINT)?;
     let user_wsol_ata = get_associated_token_address(user, &wsol);
     let tok_prog      = Pubkey::from_str(TOKEN_PROGRAM_ID)?;
-
     let create = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
         user, user, &wsol, &tok_prog,
     );
@@ -293,9 +269,7 @@ pub fn unwrap_wsol_instruction(user: &Pubkey) -> Result<Instruction> {
 }
 
 pub fn create_ata_idempotent(user: &Pubkey, mint: &Pubkey, token_2022: bool) -> Result<Instruction> {
-    let prog = Pubkey::from_str(
-        if token_2022 { TOKEN_2022_PROGRAM_ID } else { TOKEN_PROGRAM_ID },
-    )?;
+    let prog = Pubkey::from_str(if token_2022 { TOKEN_2022_PROGRAM_ID } else { TOKEN_PROGRAM_ID })?;
     Ok(spl_associated_token_account::instruction::create_associated_token_account_idempotent(
         user, user, mint, &prog,
     ))

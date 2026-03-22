@@ -3,14 +3,14 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::BotConfig;
 use crate::types::*;
 
 const SOLANA_ADDR_RE:       &str = r"\b[1-9A-HJ-NP-Za-km-z]{43,44}\b";
-const CA_PREFIX_RE:         &str = r"(?:CA|ca|contract|Contract|mint|Mint)\s*[:：]\s*([1-9A-HJ-NP-Za-km-z]{43,44})";
+const CA_PREFIX_RE:         &str = r"(?:CA|ca|contract|Contract|mint|Mint)\s*[:???]\s*([1-9A-HJ-NP-Za-km-z]{43,44})";
 const VELOCITY_WINDOW_SECS: u64  = 60;
 
 pub struct TelegramScanner {
@@ -20,11 +20,15 @@ pub struct TelegramScanner {
     ca_prefix_re: Regex,
 }
 
+// GroupState and its methods are kept for when grammers API stabilises.
+// Suppress dead-code lints while Telegram is stubbed.
+#[allow(dead_code)]
 struct GroupState {
     message_timestamps: std::collections::VecDeque<std::time::Instant>,
     recent_mints:       HashMap<String, std::time::Instant>,
 }
 
+#[allow(dead_code)]
 impl GroupState {
     fn new() -> Self {
         Self {
@@ -75,25 +79,10 @@ impl TelegramScanner {
             return Ok(());
         }
 
-        // ── grammers library API compatibility note ────────────────────────────
-        //
-        // The grammers repository (github.com/Lonami/grammers) is currently
-        // mid-rewrite at commit fa7692e (its HEAD).  At that commit the public
-        // connection API (Client::connect, Config, InitParams, Session struct,
-        // client.session().save(), Update enum at crate root) does not yet exist
-        // — those types are internal only.  Cargo resolves to this commit whether
-        // or not a `rev` pin is specified because it IS the branch HEAD.
-        //
-        // Until the grammers authors stabilise the 0.8 public API, Telegram
-        // MTProto scanning is disabled at compile time to keep the build green.
-        // Twitter and Yellowstone gRPC signals continue to work normally.
-        //
-        // To re-enable Telegram once grammers ships a stable release:
-        //   1. Add `tag = "v0.8.x"` (or the released tag) to the grammers deps
-        //      in Cargo.toml.
-        //   2. Restore the grammers-based connection code below.
-        //   3. Run `cargo update` to fetch the new revision.
-
+        // grammers is at a pre-release commit (fa7692e) where the public connection
+        // API does not yet exist.  Scanner disabled until grammers ships a stable tag.
+        // To re-enable: add tag = "v0.8.x" to Cargo.toml grammers deps and restore
+        // the connection code, then run `cargo update`.
         warn!(
             "Telegram scanner: grammers library is at a pre-release commit with no \
              public connection API — scanner disabled. \
@@ -104,13 +93,13 @@ impl TelegramScanner {
              Cargo.toml with tag = \"v0.8.x\" and restore the connection code."
         );
 
-        // Sleep for 24 h before the caller retries, to avoid a tight log-spam loop.
         tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         Ok(())
     }
 
     // ── Internal helpers kept intact for when grammers API stabilises ─────────
 
+    #[allow(dead_code)]
     async fn process_message(
         &self,
         text:           &str,
@@ -119,16 +108,12 @@ impl TelegramScanner {
         group_velocity: f64,
     ) -> Result<()> {
         if text.len() < 10 { return Ok(()); }
-
         let mints = self.extract_mint_addresses(text);
         if mints.is_empty() { return Ok(()); }
-
         let sentiment = self.score_sentiment(text);
-
         for mint in mints {
             if is_known_program(&mint) { continue; }
             if state.has_seen_mint_recently(&mint) { continue; }
-
             let signal = TokenSignal {
                 id: Uuid::new_v4(),
                 mint: mint.clone(),
@@ -151,9 +136,8 @@ impl TelegramScanner {
                 }),
                 copy_trade: None,
             };
-
             info!(
-                "📱 Telegram signal: {} | velocity: {:.0}/min | sentiment: {:.2}",
+                "Telegram signal: {} | velocity: {:.0}/min | sentiment: {:.2}",
                 &mint[..8.min(mint.len())], group_velocity, sentiment,
             );
             let _ = self.signal_tx.send(signal);
@@ -179,11 +163,11 @@ impl TelegramScanner {
         let t = text.to_lowercase();
         let bull: f64 = [
             "gem","launch","early","buy","pump","moon","alpha","call","fire","based",
-            "locked","100x","safe","legit","🚀","💎","🔥","✅","degen","ape","strong",
+            "locked","100x","safe","legit","\u{1f680}","\u{1f48e}","\u{1f525}","\u{2705}","degen","ape","strong",
         ].iter().filter(|&&s| t.contains(s)).count() as f64;
         let bear: f64 = [
             "rug","scam","dump","avoid","honeypot","bot","bundled",
-            "sniper","🚨","⚠️","danger","fake","exit","sell",
+            "sniper","\u{1f6a8}","\u{26a0}\u{fe0f}","danger","fake","exit","sell",
         ].iter().filter(|&&s| t.contains(s)).count() as f64;
         (0.5 + (bull - bear * 1.5) * 0.1).clamp(0.0, 1.0)
     }

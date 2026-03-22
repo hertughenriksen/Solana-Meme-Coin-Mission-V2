@@ -40,7 +40,7 @@ impl ModelEnsemble {
         };
         let tokenizer = if std::path::Path::new(&tok_path).exists() {
             match tokenizers::Tokenizer::from_file(&tok_path) {
-                Ok(t)  => { info!("✅ NLP tokenizer loaded from {}", tok_path); Some(Arc::new(t)) }
+                Ok(t)  => { info!("NLP tokenizer loaded from {}", tok_path); Some(Arc::new(t)) }
                 Err(e) => { warn!("Tokenizer load failed: {} — heuristic active", e); None }
             }
         } else {
@@ -60,25 +60,22 @@ impl ModelEnsemble {
         let sess  = Arc::clone(session);
         let feats = extract_tabular_features(signal);
         tokio::task::spawn_blocking(move || {
-            // FIX: use tuple form (shape, vec) to avoid the ndarray version
-            // conflict — (D, Vec<T>) is implemented entirely within ort.
+            // Tuple form avoids ndarray version conflict — implemented entirely within ort.
             let input = Tensor::from_array(([1usize, N_TABULAR], feats))
                 .map_err(|e| anyhow::anyhow!("Tensor create: {}", e))?;
             let outputs = sess.run(ort::inputs![input])
                 .map_err(|e| anyhow::anyhow!("Tabular run: {}", e))?;
-            // FIX: try_extract_tensor returns ArrayViewD from ort's internal ndarray.
-            // Do NOT destructure or annotate the type — just call .iter() on it
-            // directly so the compiler never needs to unify the two ndarray crates.
+
+            // try_extract_tensor returns (&Shape, &[f32]) — use .1 to get the slice.
             let prob: f64 = if outputs.len() >= 2 {
                 let view = outputs[1].try_extract_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("Extract[1]: {}", e))?;
-                // If shape is [batch, 2] grab class-1 (index 1), else first element
-                let vals: Vec<f32> = view.iter().copied().take(2).collect();
+                let vals: Vec<f32> = view.1.iter().copied().take(2).collect();
                 if vals.len() >= 2 { vals[1] as f64 } else { vals.first().copied().unwrap_or(0.5) as f64 }
-            } else if outputs.len() > 0 {
+            } else if !outputs.is_empty() {
                 let view = outputs[0].try_extract_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("Extract[0]: {}", e))?;
-                view.iter().copied().next().unwrap_or(0.5) as f64
+                view.1.iter().copied().next().unwrap_or(0.5) as f64
             } else {
                 return Err(anyhow::anyhow!("No outputs from tabular model"));
             };
@@ -105,7 +102,6 @@ impl ModelEnsemble {
         tokio::task::spawn_blocking(move || {
             let seq = build_price_sequence(&owned)
                 .ok_or_else(|| anyhow::anyhow!("Empty candles"))?;
-            // FIX: convert to flat vec and use tuple form
             let flat = seq.into_raw_vec();
             let input = Tensor::from_array(([1usize, SEQ_LEN, SEQ_FEAT], flat))
                 .map_err(|e| anyhow::anyhow!("Tensor: {}", e))?;
@@ -113,7 +109,7 @@ impl ModelEnsemble {
                 .map_err(|e| anyhow::anyhow!("Transformer run: {}", e))?;
             let view = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
-            let val = view.iter().copied().next().unwrap_or(0.5) as f64;
+            let val = view.1.iter().copied().next().unwrap_or(0.5) as f64;
             Ok(val.clamp(0.0, 1.0))
         }).await?
     }
@@ -136,7 +132,7 @@ impl ModelEnsemble {
                 .map_err(|e| anyhow::anyhow!("GNN run: {}", e))?;
             let view = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("GNN extract: {}", e))?;
-            let rug_prob = view.iter().copied().next().unwrap_or(0.5) as f64;
+            let rug_prob = view.1.iter().copied().next().unwrap_or(0.5) as f64;
             Ok((1.0_f64 - rug_prob).clamp(0.0, 1.0))
         }).await?
     }
@@ -162,7 +158,6 @@ impl ModelEnsemble {
             let ids:   Vec<i64> = pad_ids(enc.get_ids());
             let mask:  Vec<i64> = pad_ids(enc.get_attention_mask());
             let types: Vec<i64> = pad_ids(enc.get_type_ids());
-            // FIX: tuple form — no ndarray dependency for the input side
             let t_ids   = Tensor::from_array(([1usize, MAX_NLP_LEN], ids))
                 .map_err(|e| anyhow::anyhow!("ids tensor: {}", e))?;
             let t_mask  = Tensor::from_array(([1usize, MAX_NLP_LEN], mask))
@@ -176,7 +171,7 @@ impl ModelEnsemble {
             ]).map_err(|e| anyhow::anyhow!("NLP run: {}", e))?;
             let view = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("NLP extract: {}", e))?;
-            let val = view.iter().copied().next().unwrap_or(0.5) as f64;
+            let val = view.1.iter().copied().next().unwrap_or(0.5) as f64;
             Ok(val.clamp(0.0, 1.0))
         }).await?
     }
@@ -234,10 +229,10 @@ impl ModelEnsemble {
 // ── Feature extraction ────────────────────────────────────────────────────────
 
 fn extract_tabular_features(signal: &TokenSignal) -> Vec<f32> {
-    let now      = chrono::Utc::now();
-    let hour     = now.hour() as f32;
-    let hour_sin = (2.0 * PI32 * hour / 24.0).sin();
-    let hour_cos = (2.0 * PI32 * hour / 24.0).cos();
+    let now         = chrono::Utc::now();
+    let hour        = now.hour() as f32;
+    let hour_sin    = (2.0 * PI32 * hour / 24.0).sin();
+    let hour_cos    = (2.0 * PI32 * hour / 24.0).cos();
     let day_of_week = now.weekday().num_days_from_monday() as f32;
 
     let (
@@ -274,13 +269,13 @@ fn extract_tabular_features(signal: &TokenSignal) -> Vec<f32> {
     )).unwrap_or((0.0, 0.0, 0.5, 0.0, 0.0));
 
     let buy_sell_ratio = buy_1h / (buy_1h + sell_1h + 1.0);
-    let liq_to_mcap   = if market_cap_usd > 0.0 { liquidity_usd / market_cap_usd } else { 0.0 };
-    let vol_to_liq    = if liquidity_usd > 0.0 { vol_1h / liquidity_usd } else { 0.0 };
-    let gini          = top10.powf(1.5);
-    let liq_log       = (1.0 + liquidity_usd).ln();
-    let mcap_log      = (1.0 + market_cap_usd).ln();
-    let vol_log       = (1.0 + vol_1h).ln();
-    let smart_launch  = if mint_dis > 0.5 && freeze_dis > 0.5 && lp_locked_f > 0.5 { 1.0_f32 } else { 0.0 };
+    let liq_to_mcap    = if market_cap_usd > 0.0 { liquidity_usd / market_cap_usd } else { 0.0 };
+    let vol_to_liq     = if liquidity_usd > 0.0 { vol_1h / liquidity_usd } else { 0.0 };
+    let gini           = top10.powf(1.5);
+    let liq_log        = (1.0 + liquidity_usd).ln();
+    let mcap_log       = (1.0 + market_cap_usd).ln();
+    let vol_log        = (1.0 + vol_1h).ln();
+    let smart_launch   = if mint_dis > 0.5 && freeze_dis > 0.5 && lp_locked_f > 0.5 { 1.0_f32 } else { 0.0 };
 
     vec![
         liquidity_usd, market_cap_usd, token_age_secs,
@@ -351,8 +346,6 @@ fn load_session(path: &str, name: &str) -> Option<Arc<Session>> {
         return None;
     }
     let result = (|| -> anyhow::Result<Session> {
-        // FIX: Session::builder() returns Result<SessionBuilder> — no mut needed here.
-        // with_optimization_level takes &mut self so the SECOND binding needs mut.
         let builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("Session builder: {}", e))?;
         let mut builder = builder
@@ -365,7 +358,7 @@ fn load_session(path: &str, name: &str) -> Option<Arc<Session>> {
     })();
 
     match result {
-        Ok(s)  => { info!("✅ ONNX model loaded: {} ({})", name, path); Some(Arc::new(s)) }
+        Ok(s)  => { info!("ONNX model loaded: {} ({})", name, path); Some(Arc::new(s)) }
         Err(e) => { warn!("Failed to load ONNX '{}': {} — heuristic active", name, e); None }
     }
 }
@@ -381,6 +374,6 @@ pub async fn retrain_models() -> Result<()> {
     if !output.status.success() {
         anyhow::bail!("Retraining failed:\n{}", String::from_utf8_lossy(&output.stderr));
     }
-    tracing::info!("✅ Model retraining complete");
+    tracing::info!("Model retraining complete");
     Ok(())
 }
