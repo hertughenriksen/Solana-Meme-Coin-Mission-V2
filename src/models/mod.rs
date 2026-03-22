@@ -4,7 +4,7 @@ use ndarray::Array3;
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use std::f32::consts::PI as PI32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use crate::config::ModelsConfig;
@@ -18,10 +18,10 @@ const MAX_NLP_LEN: usize = 128;
 
 pub struct ModelEnsemble {
     config:      ModelsConfig,
-    tabular:     Option<Arc<Session>>,
-    transformer: Option<Arc<Session>>,
-    gnn:         Option<Arc<Session>>,
-    nlp:         Option<Arc<Session>>,
+    tabular:     Option<Arc<Mutex<Session>>>,
+    transformer: Option<Arc<Mutex<Session>>>,
+    gnn:         Option<Arc<Mutex<Session>>>,
+    nlp:         Option<Arc<Mutex<Session>>>,
     tokenizer:   Option<Arc<tokenizers::Tokenizer>>,
 }
 
@@ -63,7 +63,9 @@ impl ModelEnsemble {
             // Tuple form avoids ndarray version conflict — implemented entirely within ort.
             let input = Tensor::from_array(([1usize, N_TABULAR], feats))
                 .map_err(|e| anyhow::anyhow!("Tensor create: {}", e))?;
-            let outputs = sess.run(ort::inputs![input])
+            let mut session_guard = sess.lock()
+                .map_err(|e| anyhow::anyhow!("Mutex lock: {}", e))?;
+            let outputs = session_guard.run(ort::inputs![input])
                 .map_err(|e| anyhow::anyhow!("Tabular run: {}", e))?;
 
             // try_extract_tensor returns (&Shape, &[f32]) — use .1 to get the slice.
@@ -72,7 +74,7 @@ impl ModelEnsemble {
                     .map_err(|e| anyhow::anyhow!("Extract[1]: {}", e))?;
                 let vals: Vec<f32> = view.1.iter().copied().take(2).collect();
                 if vals.len() >= 2 { vals[1] as f64 } else { vals.first().copied().unwrap_or(0.5) as f64 }
-            } else if !outputs.is_empty() {
+            } else if outputs.len() > 0 {
                 let view = outputs[0].try_extract_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("Extract[0]: {}", e))?;
                 view.1.iter().copied().next().unwrap_or(0.5) as f64
@@ -105,7 +107,9 @@ impl ModelEnsemble {
             let flat = seq.into_raw_vec();
             let input = Tensor::from_array(([1usize, SEQ_LEN, SEQ_FEAT], flat))
                 .map_err(|e| anyhow::anyhow!("Tensor: {}", e))?;
-            let outputs = sess.run(ort::inputs![input])
+            let mut session_guard = sess.lock()
+                .map_err(|e| anyhow::anyhow!("Mutex lock: {}", e))?;
+            let outputs = session_guard.run(ort::inputs![input])
                 .map_err(|e| anyhow::anyhow!("Transformer run: {}", e))?;
             let view = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
@@ -128,7 +132,9 @@ impl ModelEnsemble {
         tokio::task::spawn_blocking(move || {
             let input = Tensor::from_array(([1usize, NODE_DIM], node_feats.to_vec()))
                 .map_err(|e| anyhow::anyhow!("GNN tensor: {}", e))?;
-            let outputs = sess.run(ort::inputs!["node_features" => input])
+            let mut session_guard = sess.lock()
+                .map_err(|e| anyhow::anyhow!("Mutex lock: {}", e))?;
+            let outputs = session_guard.run(ort::inputs!["node_features" => input])
                 .map_err(|e| anyhow::anyhow!("GNN run: {}", e))?;
             let view = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("GNN extract: {}", e))?;
@@ -150,7 +156,7 @@ impl ModelEnsemble {
             return self.nlp_heuristic(signal);
         }
 
-        let sess: Arc<Session>               = Arc::clone(session);
+        let sess: Arc<Mutex<Session>>       = Arc::clone(session);
         let tok:  Arc<tokenizers::Tokenizer> = Arc::clone(tokenizer);
         tokio::task::spawn_blocking(move || {
             let enc = tok.encode(text.as_str(), false)
@@ -164,7 +170,9 @@ impl ModelEnsemble {
                 .map_err(|e| anyhow::anyhow!("mask tensor: {}", e))?;
             let t_types = Tensor::from_array(([1usize, MAX_NLP_LEN], types))
                 .map_err(|e| anyhow::anyhow!("types tensor: {}", e))?;
-            let outputs = sess.run(ort::inputs![
+            let mut session_guard = sess.lock()
+                .map_err(|e| anyhow::anyhow!("Mutex lock: {}", e))?;
+            let outputs = session_guard.run(ort::inputs![
                 "input_ids"      => t_ids,
                 "attention_mask" => t_mask,
                 "token_type_ids" => t_types
@@ -340,7 +348,7 @@ fn pad_ids<T: Into<i64> + Copy>(ids: &[T]) -> Vec<i64> {
 
 // ── Session loader ────────────────────────────────────────────────────────────
 
-fn load_session(path: &str, name: &str) -> Option<Arc<Session>> {
+fn load_session(path: &str, name: &str) -> Option<Arc<Mutex<Session>>> {
     if !std::path::Path::new(path).exists() {
         warn!("ONNX model '{}' not found at {} — heuristic active", name, path);
         return None;
@@ -358,7 +366,7 @@ fn load_session(path: &str, name: &str) -> Option<Arc<Session>> {
     })();
 
     match result {
-        Ok(s)  => { info!("ONNX model loaded: {} ({})", name, path); Some(Arc::new(s)) }
+        Ok(s)  => { info!("ONNX model loaded: {} ({})", name, path); Some(Arc::new(Mutex::new(s))) }
         Err(e) => { warn!("Failed to load ONNX '{}': {} — heuristic active", name, e); None }
     }
 }
