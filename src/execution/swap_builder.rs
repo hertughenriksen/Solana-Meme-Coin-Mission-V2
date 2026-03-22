@@ -248,12 +248,10 @@ pub fn build_raydium_amm_swap(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Apply slippage tolerance: reduce minimum output by `slippage_bps` basis points.
 pub fn apply_slippage(expected_out: u64, slippage_bps: u32) -> u64 {
     expected_out.saturating_sub((expected_out * slippage_bps as u64) / 10_000)
 }
 
-/// Estimate price impact for a CPMM constant-product pool.
 pub fn estimate_price_impact_cpmm(reserve_in: u64, reserve_out: u64, amount_in: u64) -> f64 {
     if reserve_in == 0 || reserve_out == 0 { return 1.0; }
     let amount_out = (amount_in as u128 * reserve_out as u128)
@@ -263,7 +261,6 @@ pub fn estimate_price_impact_cpmm(reserve_in: u64, reserve_out: u64, amount_in: 
     (spot - exec) / spot
 }
 
-/// Wrap native SOL into wSOL ATA, ready for token-program swaps.
 pub fn wrap_sol_instructions(user: &Pubkey, lamports: u64) -> Result<Vec<Instruction>> {
     let wsol          = Pubkey::from_str(WSOL_MINT)?;
     let user_wsol_ata = get_associated_token_address(user, &wsol);
@@ -273,7 +270,6 @@ pub fn wrap_sol_instructions(user: &Pubkey, lamports: u64) -> Result<Vec<Instruc
         user, user, &wsol, &tok_prog,
     );
     let transfer = solana_sdk::system_instruction::transfer(user, &user_wsol_ata, lamports);
-    // SyncNative instruction (discriminator 17)
     let sync = Instruction {
         program_id: tok_prog,
         accounts: vec![AccountMeta::new(user_wsol_ata, false)],
@@ -282,11 +278,9 @@ pub fn wrap_sol_instructions(user: &Pubkey, lamports: u64) -> Result<Vec<Instruc
     Ok(vec![create, transfer, sync])
 }
 
-/// Close the wSOL ATA, converting its balance back to native SOL.
 pub fn unwrap_wsol_instruction(user: &Pubkey) -> Result<Instruction> {
     let wsol          = Pubkey::from_str(WSOL_MINT)?;
     let user_wsol_ata = get_associated_token_address(user, &wsol);
-    // CloseAccount instruction (discriminator 9)
     Ok(Instruction {
         program_id: Pubkey::from_str(TOKEN_PROGRAM_ID)?,
         accounts: vec![
@@ -298,7 +292,6 @@ pub fn unwrap_wsol_instruction(user: &Pubkey) -> Result<Instruction> {
     })
 }
 
-/// Create an associated token account idempotently (does nothing if it already exists).
 pub fn create_ata_idempotent(user: &Pubkey, mint: &Pubkey, token_2022: bool) -> Result<Instruction> {
     let prog = Pubkey::from_str(
         if token_2022 { TOKEN_2022_PROGRAM_ID } else { TOKEN_PROGRAM_ID },

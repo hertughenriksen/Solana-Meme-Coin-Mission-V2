@@ -126,11 +126,7 @@ impl Database {
         })
     }
 
-    /// Returns training-mode statistics used by the /training dashboard page.
-    /// Queries are broken into separate statements to avoid CASE WHEN type
-    /// inference issues with sqlx's compile-time checker.
     pub async fn get_training_stats(&self) -> Result<TrainingStats> {
-        // ── Token counts ──────────────────────────────────────────────────────
         let token_row = sqlx::query!(r#"
             SELECT
                 COUNT(*)                                                   AS total_tokens,
@@ -145,7 +141,6 @@ impl Database {
             FROM tokens
         "#).fetch_one(&self.pool).await?;
 
-        // ── Signal source breakdown ───────────────────────────────────────────
         let sig_row = sqlx::query!(r#"
             SELECT
                 COUNT(*)                                                   AS total_signals,
@@ -156,7 +151,6 @@ impl Database {
             FROM signals
         "#).fetch_one(&self.pool).await?;
 
-        // ── Top rejection reasons ─────────────────────────────────────────────
         let rej_rows = sqlx::query!(r#"
             SELECT
                 COALESCE(filter_rejection_reason, 'Unknown') AS reason,
@@ -168,14 +162,13 @@ impl Database {
             LIMIT 8
         "#).fetch_all(&self.pool).await?;
 
-        // ── Training session start ────────────────────────────────────────────
         let session_row = sqlx::query!(
             "SELECT started_at FROM training_sessions ORDER BY started_at ASC LIMIT 1"
         ).fetch_optional(&self.pool).await?;
 
-        let total     = token_row.total_tokens.unwrap_or(0);
-        let passed    = token_row.tokens_passed.unwrap_or(0);
-        let hours     = token_row.hours_of_data.unwrap_or(0.0) as f64;
+        let total  = token_row.total_tokens.unwrap_or(0);
+        let passed = token_row.tokens_passed.unwrap_or(0);
+        let hours  = token_row.hours_of_data.unwrap_or(0.0) as f64;
 
         Ok(TrainingStats {
             total_tokens:     total,
@@ -199,8 +192,6 @@ impl Database {
         })
     }
 
-    /// Counts consecutive losses at the head of the closed-trade list.
-    /// A losing streak is broken the moment a winning trade is encountered.
     pub async fn count_consecutive_losses(&self) -> Result<i64> {
         let rows = sqlx::query!(
             r#"SELECT pnl_sol::float8 AS pnl_sol
@@ -220,7 +211,6 @@ impl Database {
         Ok(count)
     }
 
-    /// Kept for compatibility — circuit breaker now uses count_consecutive_losses.
     pub async fn count_recent_losses(&self, hours: u32) -> Result<i64> {
         let row = sqlx::query!(
             "SELECT COUNT(*) as cnt FROM trades WHERE status='closed' AND pnl_sol < 0
@@ -230,8 +220,6 @@ impl Database {
         Ok(row.cnt.unwrap_or(0))
     }
 
-    /// Persists `source_wallet` from `CopyTradeData` so outcome_tracker.py
-    /// can attribute wins/losses back to the originating copy-trade wallet.
     pub async fn log_signal(&self, signal: &TokenSignal, passed: bool, rejection: Option<&str>) -> Result<()> {
         let source_wallet: Option<&str> = signal
             .copy_trade
@@ -264,5 +252,14 @@ impl Database {
             candle.close, candle.volume, candle.buy_count as i32, candle.sell_count as i32,
         ).execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// FIX: actual implementation for the training-start API endpoint.
+    /// The original monitor handler dropped the query without executing it.
+    pub async fn start_training_session(&self) -> Result<i32> {
+        let row = sqlx::query!(
+            "INSERT INTO training_sessions (started_at) VALUES (NOW()) RETURNING id"
+        ).fetch_one(&self.pool).await?;
+        Ok(row.id)
     }
 }

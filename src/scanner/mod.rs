@@ -28,11 +28,8 @@ impl YellowstoneScanner {
 
         info!("🔍 Yellowstone scanner: connecting to {}", &url[..url.len().min(40)]);
 
-        // Yellowstone gRPC connection requires the yellowstone-grpc-client crate.
-        // When credentials are configured, this will stream all Pump.fun and
-        // Raydium launch/swap transactions in real time.
         warn!("Yellowstone scanner: gRPC streaming not yet implemented — use Twitter/Telegram signals");
-        let _ = &self.signal_tx; // keep field live; suppress dead_code lint
+        let _ = &self.signal_tx;
         tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         Ok(())
     }

@@ -12,7 +12,6 @@ echo -e "╚══════════════════════�
 
 OS=$(uname -s)
 
-# ── 1. System dependencies ────────────────────────────────────────────────────
 echo -e "\n${YELLOW}[1/8] Installing system dependencies...${NC}"
 if [[ "$OS" == "Linux" ]]; then
     sudo apt-get update -qq
@@ -25,7 +24,6 @@ if [[ "$OS" == "Linux" ]]; then
 fi
 echo -e "${GREEN}✓ System dependencies installed${NC}"
 
-# ── 2. Rust ───────────────────────────────────────────────────────────────────
 echo -e "\n${YELLOW}[2/8] Installing Rust toolchain...${NC}"
 if ! command -v rustup &>/dev/null; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -34,7 +32,6 @@ fi
 rustup update stable
 echo -e "${GREEN}✓ Rust $(rustc --version)${NC}"
 
-# ── 3. Python virtual environment ────────────────────────────────────────────
 echo -e "\n${YELLOW}[3/8] Setting up Python environment...${NC}"
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -66,7 +63,6 @@ pip install \
 deactivate
 echo -e "${GREEN}✓ Python environment ready at .venv/${NC}"
 
-# ── 4. PostgreSQL ─────────────────────────────────────────────────────────────
 echo -e "\n${YELLOW}[4/8] Configuring PostgreSQL...${NC}"
 sudo -u postgres psql -c "CREATE USER bot WITH PASSWORD 'password';" 2>/dev/null || true
 sudo -u postgres psql -c "CREATE DATABASE memecoin_bot OWNER bot;" 2>/dev/null || true
@@ -84,7 +80,6 @@ else
 fi
 echo -e "${GREEN}✓ PostgreSQL ready (db: memecoin_bot, user: bot)${NC}"
 
-# ── 5. Redis ──────────────────────────────────────────────────────────────────
 echo -e "\n${YELLOW}[5/8] Checking Redis...${NC}"
 if redis-cli ping 2>/dev/null | grep -q PONG; then
     echo -e "${GREEN}✓ Redis running${NC}"
@@ -95,77 +90,65 @@ else
         echo -e "${RED}✗ Redis not responding — start manually: sudo systemctl start redis-server${NC}"
 fi
 
-# ── 6. Wallet keypair ─────────────────────────────────────────────────────────
-echo -e "\n${YELLOW}[6/8] Setting up wallet keypair...${NC}"
+echo -e "\n${YELLOW}[6/8] Setting up wallet keypairs...${NC}"
 mkdir -p secrets && chmod 700 secrets
 
+if ! command -v solana-keygen &>/dev/null; then
+    echo "  Installing Solana CLI..."
+    sh -c "$(curl -sSfL https://release.solana.com/stable/install)" 2>/dev/null
+    export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+    SHELL_PROFILE="$HOME/.bashrc"
+    if [[ "$SHELL" == *"zsh"* ]]; then SHELL_PROFILE="$HOME/.zshrc"; fi
+    echo 'export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"' >> "$SHELL_PROFILE"
+fi
+
 if [ ! -f secrets/keypair.json ]; then
-    # Install Solana CLI if not present
-    if ! command -v solana-keygen &>/dev/null; then
-        echo "  Installing Solana CLI..."
-        sh -c "$(curl -sSfL https://release.solana.com/stable/install)" 2>/dev/null
-        export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
-        # Add to shell profile
-        SHELL_PROFILE="$HOME/.bashrc"
-        if [[ "$SHELL" == *"zsh"* ]]; then SHELL_PROFILE="$HOME/.zshrc"; fi
-        echo 'export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"' >> "$SHELL_PROFILE"
-    fi
     solana-keygen new --no-passphrase --outfile secrets/keypair.json
     chmod 600 secrets/keypair.json
     PUBKEY=$(solana-keygen pubkey secrets/keypair.json 2>/dev/null || echo "unknown")
-    echo -e "${GREEN}✓ New keypair generated${NC}"
+    echo -e "${GREEN}✓ Trading keypair generated${NC}"
     echo -e "${RED}  ⚠  PUBLIC KEY: ${PUBKEY}${NC}"
     echo -e "${RED}  ⚠  BACK UP secrets/keypair.json BEFORE FUNDING THIS WALLET${NC}"
 else
-    echo -e "${GREEN}✓ Keypair already exists at secrets/keypair.json${NC}"
+    echo -e "${GREEN}✓ Trading keypair already exists${NC}"
 fi
 
-# ── 7. Environment file ───────────────────────────────────────────────────────
+if [ ! -f secrets/jito_keypair.json ]; then
+    solana-keygen new --no-passphrase --outfile secrets/jito_keypair.json
+    chmod 600 secrets/jito_keypair.json
+    echo -e "${GREEN}✓ Jito auth keypair generated (no SOL needed in this wallet)${NC}"
+else
+    echo -e "${GREEN}✓ Jito keypair already exists${NC}"
+fi
+
 echo -e "\n${YELLOW}[7/8] Setting up environment file...${NC}"
 if [ ! -f .env ]; then
     if [ -f .env.example ]; then
         cp .env.example .env
         echo -e "${GREEN}✓ .env created from .env.example — fill in your API keys${NC}"
-    else
-        cat > .env << 'EOF'
-HELIUS_API_KEY=your_helius_key_here
-HELIUS_GRPC_URL=your_grpc_url_here
-HELIUS_GRPC_TOKEN=your_grpc_token_here
-QUICKNODE_URL=your_quicknode_url_here
-TWITTER_BEARER_TOKEN=your_twitter_token_here
-TELEGRAM_API_ID=your_telegram_id_here
-TELEGRAM_API_HASH=your_telegram_hash_here
-BIRDEYE_API_KEY=your_birdeye_key_here
-DATABASE_URL=postgresql://bot:password@localhost:5432/memecoin_bot
-REDIS_URL=redis://localhost:6379
-EOF
-        echo -e "${GREEN}✓ .env created — fill in your API keys${NC}"
     fi
 else
     echo -e "${GREEN}✓ .env already exists${NC}"
 fi
 
-# ── 8. Config file ────────────────────────────────────────────────────────────
 if [ ! -f config/local.toml ]; then
     if [ -f config/default.toml ]; then
         cp config/default.toml config/local.toml
         echo -e "${GREEN}✓ config/local.toml created from default.toml${NC}"
-        echo -e "${YELLOW}  → Edit config/local.toml and replace all YOUR_* values with real API keys${NC}"
+        echo -e "${YELLOW}  → Edit config/local.toml and replace all YOUR_* values${NC}"
     fi
 fi
 
-# ── 9. Build ──────────────────────────────────────────────────────────────────
-echo -e "\n${YELLOW}[8/8] Building Rust bot (this takes 5-15 minutes on first run)...${NC}"
+echo -e "\n${YELLOW}[8/8] Building Rust bot (5-15 minutes on first run)...${NC}"
 source "$HOME/.cargo/env"
 
 if cargo build --release 2>&1 | tail -5; then
     echo -e "${GREEN}✓ Build successful${NC}"
 else
-    echo -e "${YELLOW}⚠ Build failed — this is usually because API keys are not set yet.${NC}"
+    echo -e "${YELLOW}⚠ Build failed — API keys may not be set yet.${NC}"
     echo -e "${YELLOW}  Fill in config/local.toml and run: cargo build --release${NC}"
 fi
 
-# ── Done ──────────────────────────────────────────────────────────────────────
 echo -e ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗"
 echo -e "║  Setup complete! Next steps:                             ║"
@@ -180,17 +163,17 @@ echo -e "║  3. Run the bot in dry mode (NO real trades):           ║"
 echo -e "║     cargo run --release --bin bot                       ║"
 echo -e "║                                                          ║"
 echo -e "║  4. Dashboard → http://localhost:8080                   ║"
+echo -e "║  5. Training → http://localhost:8080/training           ║"
 echo -e "║                                                          ║"
-echo -e "║  5. Run dry mode for 2+ weeks to collect training data  ║"
+echo -e "║  6. Run dry mode for 2+ weeks to collect training data  ║"
 echo -e "║                                                          ║"
-echo -e "║  6. Train ML models:                                    ║"
+echo -e "║  7. Train ML models:                                    ║"
 echo -e "║     source .venv/bin/activate                           ║"
 echo -e "║     python ml/scripts/train_all.py                      ║"
 echo -e "║                                                          ║"
-echo -e "║  7. Only then set dry_run=false with tiny capital       ║"
+echo -e "║  8. Only then set dry_run=false with tiny capital       ║"
 echo -e "╚══════════════════════════════════════════════════════════╝${NC}"
-
 echo -e ""
 echo -e "${RED}⚠  NEVER trade funds you cannot afford to lose entirely."
 echo -e "⚠  Run dry_run=true for at least 2 weeks first."
-echo -e "⚠  Back up secrets/keypair.json before funding the wallet.${NC}"
+echo -e "⚠  Back up secrets/keypair.json and secrets/jito_keypair.json.${NC}"

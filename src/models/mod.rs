@@ -4,12 +4,8 @@ use tracing::{info, warn};
 use crate::config::ModelsConfig;
 use crate::types::*;
 
-/// ModelEnsemble — loads ONNX models at startup.
-/// If a model file is missing, returns 0.5 (neutral) so the bot can
-/// still operate during the initial dry-run data-collection phase.
 pub struct ModelEnsemble {
     config: ModelsConfig,
-    // ort::Session handles added here once ONNX files are trained and present
 }
 
 impl ModelEnsemble {
@@ -23,23 +19,16 @@ impl ModelEnsemble {
             if std::path::Path::new(path).exists() {
                 info!("✅ Found model: {} ({})", name, path);
             } else {
-                warn!(
-                    "Model '{}' not found at {} — returning 0.5 neutral score",
-                    name, path,
-                );
+                warn!("Model '{}' not found at {} — returning 0.5 neutral score", name, path);
             }
         }
         Ok(Self { config: config.clone() })
     }
 
-    /// Returns 0.5 until ONNX model is trained and loaded.
-    /// Run `python ml/scripts/train_all.py` to generate the model file.
     pub async fn score_tabular(&self, _signal: &TokenSignal) -> Result<f64> {
         Ok(0.5)
     }
 
-    /// Heuristic based on buy/sell candle dominance.
-    /// Replaced by the real ONNX transformer after `train_all.py` runs.
     pub async fn score_transformer(&self, signal: &TokenSignal) -> Result<f64> {
         let candles = signal
             .on_chain.as_ref()
@@ -56,14 +45,6 @@ impl ModelEnsemble {
         Ok(buy_dom.clamp(0.0, 1.0))
     }
 
-    /// Heuristic based on deployer age and sniper concentration.
-    /// Replaced by the real ONNX GNN after `train_gnn.py` runs.
-    ///
-    /// FIX: the original filtered only on `TokenOutcome::Rug`.  With the
-    /// expanded TokenOutcome enum, Honeypot and FakePump are also negative
-    /// outcomes that should penalise a deployer's score.  Now uses the
-    /// `TokenOutcome::is_negative()` helper so any future additions are
-    /// automatically included.
     pub async fn score_gnn(&self, signal: &TokenSignal) -> Result<f64> {
         let score = signal.on_chain.as_ref().map(|d| {
             let age_score      = (d.deployer_wallet_age_days as f64 / 365.0).min(1.0) * 0.4;
@@ -77,8 +58,6 @@ impl ModelEnsemble {
         Ok(score)
     }
 
-    /// Uses pre-computed sentiment from the signal scanner.
-    /// Replaced by the real ONNX FinBERT model after `train_nlp.py` runs.
     pub async fn score_nlp(&self, signal: &TokenSignal) -> Result<f64> {
         Ok(signal.social.as_ref().map(|s| {
             let base  = s.sentiment_score;

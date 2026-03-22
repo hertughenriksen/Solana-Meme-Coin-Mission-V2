@@ -2,6 +2,11 @@
 train_all.py — Master ML Training Pipeline
 Trains: CatBoost+LightGBM tabular, Price Transformer, delegates GNN & NLP.
 Usage: python ml/scripts/train_all.py --db-url $DATABASE_URL
+
+FIX: onnxmltools.convert_catboost was removed in recent onnxmltools versions.
+     CatBoost now supports native ONNX export via model.save_model(..., format='onnx').
+     LightGBM export still uses onnxmltools (convert_lightgbm), which remains
+     stable as of onnxmltools 1.12.
 """
 import argparse, json, logging, os, warnings
 from pathlib import Path
@@ -128,13 +133,31 @@ def train_tabular(train_df, test_df):
     return {"catboost": cb_model, "lgbm": lgb_model, "threshold": best_thr}, metrics
 
 def export_tabular_onnx(models, out_dir):
+    """
+    FIX: onnxmltools.convert_catboost no longer exists in recent versions.
+    CatBoost has native ONNX export via CatBoostClassifier.save_model(..., format='onnx').
+    LightGBM ONNX export via onnxmltools is still available and unchanged.
+    """
     import onnxmltools
     from onnxmltools.convert.common.data_types import FloatTensorType
+
     n = len(TABULAR_FEATURES)
-    cb_onnx  = onnxmltools.convert_catboost(models["catboost"], initial_types=[("input", FloatTensorType([None, n]))])
-    lgb_onnx = onnxmltools.convert_lightgbm(models["lgbm"],    initial_types=[("input", FloatTensorType([None, n]))])
-    onnx.save(cb_onnx,  f"{out_dir}/catboost.onnx")
-    onnx.save(lgb_onnx, f"{out_dir}/lightgbm.onnx")
+
+    # CatBoost native ONNX export
+    cb_onnx_path = f"{out_dir}/catboost.onnx"
+    models["catboost"].save_model(cb_onnx_path, format="onnx",
+                                  export_parameters={"onnx_domain": "ai.catboost",
+                                                     "onnx_model_version": 1,
+                                                     "onnx_doc_string": "CatBoost tabular classifier"})
+    log.info(f"CatBoost ONNX exported (native) → {cb_onnx_path}")
+
+    # LightGBM via onnxmltools (still works as of onnxmltools 1.12)
+    lgb_onnx  = onnxmltools.convert_lightgbm(models["lgbm"],
+                    initial_types=[("input", FloatTensorType([None, n]))])
+    lgb_onnx_path = f"{out_dir}/lightgbm.onnx"
+    onnx.save(lgb_onnx, lgb_onnx_path)
+    log.info(f"LightGBM ONNX exported → {lgb_onnx_path}")
+
     json.dump({"threshold": models["threshold"]}, open(f"{out_dir}/tabular_threshold.json","w"))
     log.info(f"✅ Tabular ONNX exported → {out_dir}/")
 
@@ -156,7 +179,6 @@ class PriceTransformer(nn.Module):
 def train_transformer(train_df, test_df, out_dir):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Transformer training on {device}")
-    # Requires price_candles_2s column — skip if not present
     if "price_candles_2s" not in train_df.columns:
         log.warning("No price_candles_2s column — skipping transformer training")
         return None, {}

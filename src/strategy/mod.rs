@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::config::BotConfig;
 use crate::db::{Database, RedisClient};
 use crate::filter::FilterPipeline;
-use crate::monitor::record_trade_exited; // FIX: was defined but never called
+use crate::monitor::record_trade_exited;
 use crate::types::*;
 
 pub struct StrategyEngine {
@@ -61,8 +61,7 @@ impl StrategyEngine {
 
         let fr = self.filter.evaluate(&signal).await?;
 
-        // FIX: log_signal was never called — the signals table remained empty,
-        // making post-session analytics and copy-wallet stat attribution impossible.
+        // Log every signal to the DB so analytics and copy-wallet attribution work.
         {
             let db       = self.db.clone();
             let sig_log  = signal.clone();
@@ -148,8 +147,8 @@ impl StrategyEngine {
             let entry = pos.entry_price_usd;
             if entry <= 0.0 { continue; }
 
-            let mult = price / entry;
-            let pnl_pct = mult - 1.0; // used at each exit point below
+            let mult    = price / entry;
+            let pnl_pct = mult - 1.0;
             let age_min = pos.entered_at
                 .map(|t| chrono::Utc::now().signed_duration_since(t).num_minutes() as u32)
                 .unwrap_or(0);
@@ -170,7 +169,6 @@ impl StrategyEngine {
 
             if mult <= (1.0 - cfg.hard_stop_loss_pct) {
                 warn!("🛑 Stop loss {:.2}x on {} — full exit", mult, &pos.mint[..pos.mint.len().min(8)]);
-                // FIX: pass pnl_pct so fire_full_exit can record the metric
                 self.fire_full_exit(&pos, pnl_pct).await?;
                 self.check_circuit_breaker().await?;
                 continue;
@@ -206,8 +204,6 @@ impl StrategyEngine {
         Ok(())
     }
 
-    /// FIX: now accepts `pnl_pct` so it can call `record_trade_exited` and
-    /// populate Prometheus metrics that were previously always zero.
     async fn fire_full_exit(&self, pos: &Trade, pnl_pct: f64) -> Result<()> {
         self.fire_partial_sell(pos, 1.0).await?;
         self.redis.remove_open_position(&pos.mint).await?;
@@ -247,12 +243,8 @@ impl StrategyEngine {
         Ok(self.redis.get_circuit_breaker_active().await.unwrap_or(false))
     }
 
-    /// FIX: was calling `count_recent_losses(1)` which counts ALL losses in the
-    /// last hour — not consecutive ones.  The config field is named
-    /// `circuit_breaker_consecutive_losses` and the intent is clearly to pause
-    /// after a losing *streak*, not after N scattered losses.  Now uses
-    /// `count_consecutive_losses()` which walks backwards through closed trades
-    /// and stops at the first win.
+    /// Uses consecutive-loss count (not hourly count) so the breaker triggers
+    /// on a losing streak rather than scattered losses over an hour.
     async fn check_circuit_breaker(&self) -> Result<()> {
         let consecutive = self.db.count_consecutive_losses().await?;
         let cfg = &self.config.strategy;

@@ -47,20 +47,18 @@ impl Dashboard {
         });
 
         let app = Router::new()
-            // ── Live trading dashboard ──────────────────────────────────────
-            .route("/",                  get(live_dashboard_html))
-            .route("/api/stats",         get(api_stats))
-            .route("/api/positions",     get(api_positions))
-            .route("/health",            get(|| async { "ok" }))
-            // ── Training mode dashboard ─────────────────────────────────────
-            .route("/training",          get(training_dashboard_html))
-            .route("/api/training-stats",get(api_training_stats))
-            .route("/api/training/start",post(api_training_start))
+            .route("/",                   get(live_dashboard_html))
+            .route("/api/stats",          get(api_stats))
+            .route("/api/positions",      get(api_positions))
+            .route("/health",             get(|| async { "ok" }))
+            .route("/training",           get(training_dashboard_html))
+            .route("/api/training-stats", get(api_training_stats))
+            .route("/api/training/start", post(api_training_start))
             .with_state(state);
 
         let addr = format!("0.0.0.0:{}", self.config.monitor.dashboard_port);
-        info!("Dashboard:         http://localhost:{}", self.config.monitor.dashboard_port);
-        info!("Training mode:     http://localhost:{}/training", self.config.monitor.dashboard_port);
+        info!("Dashboard:     http://localhost:{}", self.config.monitor.dashboard_port);
+        info!("Training mode: http://localhost:{}/training", self.config.monitor.dashboard_port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;
         Ok(())
@@ -134,30 +132,37 @@ th{{background:#1a1a2e;color:#9945FF;font-size:.72em;text-transform:uppercase;le
 </nav>
 <h1>🤖 SOLANA MEMECOIN BOT{mode_badge}</h1>
 <div class="grid">
-  <div class="card"><div class="label">PnL (24h)</div><div class="val" style="color:{pnl_color}">{:+.4} SOL</div></div>
-  <div class="card"><div class="label">Win Rate</div><div class="val" style="color:#00ff88">{:.1}%</div></div>
-  <div class="card"><div class="label">Trades</div><div class="val" style="color:#9945FF">{}</div></div>
-  <div class="card"><div class="label">Open</div><div class="val" style="color:#ffd700">{}</div></div>
-  <div class="card"><div class="label">Scanned</div><div class="val">{}</div></div>
-  <div class="card"><div class="label">Filter Pass</div><div class="val">{:.1}%</div></div>
-  <div class="card"><div class="label">Jito Tips</div><div class="val" style="color:#ff4444">{:.4} SOL</div></div>
-  <div class="card"><div class="label">Bundle Accept</div><div class="val" style="color:#00ff88">{:.0}%</div></div>
+  <div class="card"><div class="label">PnL (24h)</div><div class="val" style="color:{pnl_color}">{pnl:+.4} SOL</div></div>
+  <div class="card"><div class="label">Win Rate</div><div class="val" style="color:#00ff88">{wr:.1}%</div></div>
+  <div class="card"><div class="label">Trades</div><div class="val" style="color:#9945FF">{tt}</div></div>
+  <div class="card"><div class="label">Open</div><div class="val" style="color:#ffd700">{op}</div></div>
+  <div class="card"><div class="label">Scanned</div><div class="val">{sc}</div></div>
+  <div class="card"><div class="label">Filter Pass</div><div class="val">{pr:.1}%</div></div>
+  <div class="card"><div class="label">Jito Tips</div><div class="val" style="color:#ff4444">{tips:.4} SOL</div></div>
+  <div class="card"><div class="label">Bundle Accept</div><div class="val" style="color:#00ff88">{tr:.0}%</div></div>
 </div>
 <h2>Open Positions</h2>
 <table><tr><th>Mint</th><th>Track</th><th>Size (SOL)</th><th>ML Score</th><th>Status</th></tr>
 {rows}</table>
-<div class="foot">Auto-refresh 5s | {}</div>
+<div class="foot">Auto-refresh 5s | {ts}</div>
 </body></html>"#,
-        stats.total_pnl_sol, stats.win_rate * 100.0, stats.total_trades,
-        stats.open_positions, scanned, pass_rate,
-        stats.jito_tips_paid_sol, tip_rate,
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        mode_badge = mode_badge,
+        pnl_color  = pnl_color,
+        pnl        = stats.total_pnl_sol,
+        wr         = stats.win_rate * 100.0,
+        tt         = stats.total_trades,
+        op         = stats.open_positions,
+        sc         = scanned,
+        pr         = pass_rate,
+        tips       = stats.jito_tips_paid_sol,
+        tr         = tip_rate,
+        rows       = rows,
+        ts         = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
     ))
 }
 
 // ── Training mode dashboard ───────────────────────────────────────────────────
 
-/// JSON endpoint consumed by fetch() on the training page for live updates.
 async fn api_training_stats(State(s): State<Arc<DState>>) -> impl IntoResponse {
     match s.db.get_training_stats().await {
         Ok(ts) => Json(serde_json::to_value(&ts).unwrap()).into_response(),
@@ -165,19 +170,14 @@ async fn api_training_stats(State(s): State<Arc<DState>>) -> impl IntoResponse {
     }
 }
 
-/// Allows the dashboard button to (re-)start a training session record.
+/// FIX: the original handler created a sqlx::query! value and immediately
+/// dropped it without executing anything. Now inserts an actual row via a
+/// raw query through the pool exposed by Database::raw_pool().
 async fn api_training_start(State(s): State<Arc<DState>>) -> impl IntoResponse {
-    // We don't expose a raw DB query from the handler; call through the normal
-    // DB layer so connection-pool limits are respected.
-    // A new row in training_sessions marks this as a fresh collection window.
-    let result = sqlx::query!(
-        "INSERT INTO training_sessions (started_at) VALUES (NOW()) RETURNING id"
-    );
-    // Use a raw query via the pool — training start is a rare admin action.
-    // In a full implementation this would go through Database::start_training_session().
-    drop(result); // placeholder — see note below
-    // For now, just return success; the migration already seeded one row.
-    (StatusCode::OK, "Training session recorded").into_response()
+    match s.db.start_training_session().await {
+        Ok(_)  => (StatusCode::OK, "Training session recorded").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 async fn training_dashboard_html(State(s): State<Arc<DState>>) -> Html<String> {
@@ -186,7 +186,6 @@ async fn training_dashboard_html(State(s): State<Arc<DState>>) -> Html<String> {
     let dry_msg = if is_dry { "✅ dry_run = true" } else { "⚠️ dry_run = false — enable for training" };
     let dry_col = if is_dry { "#00ff88" } else { "#ffd700" };
 
-    // Progress toward 2-week (336 h) target.
     const TARGET_HOURS: f64 = 336.0;
     let pct       = (ts.hours_of_data / TARGET_HOURS * 100.0).min(100.0);
     let pct_int   = pct as u32;
@@ -200,24 +199,20 @@ async fn training_dashboard_html(State(s): State<Arc<DState>>) -> Html<String> {
         format!("~{:.1} days remaining ({:.0} h)", days_left, hours_left)
     };
 
-    // Labeled token breakdown.
     let label_total  = ts.positive_labels + ts.negative_labels;
     let pos_pct      = if label_total > 0 { ts.positive_labels as f64 / label_total as f64 * 100.0 } else { 0.0 };
     let labeled_pct  = if ts.total_tokens > 0 { ts.labeled_tokens as f64 / ts.total_tokens as f64 * 100.0 } else { 0.0 };
 
-    // Signal source bar widths (normalised to total_signals).
     let sig_total_f  = ts.total_signals.max(1) as f64;
     let tw_w         = (ts.twitter_signals    as f64 / sig_total_f * 200.0) as u32;
     let tg_w         = (ts.telegram_signals   as f64 / sig_total_f * 200.0) as u32;
     let ys_w         = (ts.yellowstone_signals as f64 / sig_total_f * 200.0) as u32;
     let ct_w         = (ts.copy_trade_signals  as f64 / sig_total_f * 200.0) as u32;
 
-    // Collection start timestamp.
     let started_str  = ts.collection_started_at
         .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "not recorded".into());
 
-    // Rejection table rows.
     let rej_rows = ts.top_rejections.iter().enumerate().map(|(i, r)| {
         let max_cnt = ts.top_rejections.first().map(|r| r.count).unwrap_or(1).max(1) as f64;
         let bar_w   = (r.count as f64 / max_cnt * 120.0) as u32;
@@ -230,16 +225,20 @@ async fn training_dashboard_html(State(s): State<Arc<DState>>) -> Html<String> {
         )
     }).collect::<Vec<_>>().join("");
 
+    // FIX: build button attributes as regular Rust strings so there are no
+    // literal `{btn_disabled}` placeholders leaking into the HTML output.
     let train_btn_style = if ready {
         "background:#00ff88;color:#000;font-weight:bold;cursor:pointer"
     } else {
         "background:#1e1e2e;color:#444;cursor:not-allowed"
     };
-    let train_btn_title = if ready {
-        "Training data ready — run train_all.py"
-    } else {
-        "Not enough data yet — keep collecting"
-    };
+    let train_btn_disabled = if ready { "" } else { "disabled" };
+    let train_btn_title    = if ready { "Training data ready — run train_all.py" } else { "Not enough data yet — keep collecting" };
+    let train_btn_label    = if ready { "🚀 Start Training Now" } else { "⏳ Still collecting…" };
+
+    let empty_rej = if ts.top_rejections.is_empty() {
+        "<tr><td colspan='4' style='color:#444;text-align:center;padding:20px'>No filter data yet — tokens are still being collected</td></tr>"
+    } else { "" };
 
     Html(format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><title>Solana Memecoin Bot — Training Mode</title>
@@ -257,27 +256,22 @@ h2{{color:#9945FF;margin:24px 0 10px;font-size:.9em;text-transform:uppercase;let
 .label{{color:#555;font-size:.72em;text-transform:uppercase;letter-spacing:1px}}
 .val{{font-size:1.45em;font-weight:bold;margin-top:6px}}
 .sub{{color:#555;font-size:.72em;margin-top:4px}}
-/* Progress bar */
 .prog-wrap{{background:#12121a;border:1px solid #1e1e2e;border-radius:10px;padding:20px;margin-bottom:22px}}
 .prog-header{{display:flex;justify-content:space-between;margin-bottom:10px;font-size:.85em}}
 .prog-track{{background:#1a1a2e;height:22px;border-radius:11px;overflow:hidden}}
 .prog-fill{{height:22px;border-radius:11px;transition:width .4s;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;font-size:.72em;font-weight:bold;color:#000}}
 .prog-eta{{margin-top:8px;font-size:.78em;color:#666;text-align:right}}
-/* Source bars */
 .src-row{{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:.8em}}
 .src-label{{width:110px;color:#666;text-align:right}}
 .src-track{{flex:1;background:#1a1a2e;height:14px;border-radius:7px;overflow:hidden}}
 .src-fill{{height:14px;border-radius:7px}}
 .src-cnt{{width:60px;text-align:right;color:#9945FF}}
-/* Table */
 table{{width:100%;border-collapse:collapse;background:#12121a;border-radius:8px;overflow:hidden}}
 th,td{{padding:9px 14px;text-align:left;border-bottom:1px solid #1e1e2e;font-size:.8em}}
 th{{background:#1a1a2e;color:#9945FF;font-size:.7em;text-transform:uppercase;letter-spacing:1px}}
-/* Status strip */
 .status-strip{{background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:12px 16px;display:flex;gap:24px;margin-bottom:22px;font-size:.8em;align-items:center;flex-wrap:wrap}}
 .status-item{{display:flex;flex-direction:column;gap:2px}}
 .status-key{{color:#555;font-size:.7em;text-transform:uppercase}}
-/* Button */
 .train-btn{{display:inline-block;margin-top:14px;padding:10px 22px;border-radius:8px;font-family:inherit;font-size:.85em;border:none;{train_btn_style}}}
 .foot{{margin-top:18px;color:#333;font-size:.72em;text-align:center}}
 </style></head><body>
@@ -286,32 +280,15 @@ th{{background:#1a1a2e;color:#9945FF;font-size:.7em;text-transform:uppercase;let
   <a href="/training" class="active">🧠 Training Mode</a>
 </nav>
 <h1>🧠 TRAINING MODE — DATA COLLECTION</h1>
-<p class="subtitle">
-  Run the bot in <code>dry_run = true</code> mode for at least 2 weeks before training ML models.
-  This page auto-refreshes every 10 s.
-</p>
+<p class="subtitle">Run the bot in <code>dry_run = true</code> mode for at least 2 weeks before training ML models. Auto-refreshes every 10 s.</p>
 
-<!-- Status strip -->
 <div class="status-strip">
-  <div class="status-item">
-    <span class="status-key">Bot mode</span>
-    <span style="color:{dry_col}">{dry_msg}</span>
-  </div>
-  <div class="status-item">
-    <span class="status-key">Collection started</span>
-    <span>{started_str}</span>
-  </div>
-  <div class="status-item">
-    <span class="status-key">Tokens/hour</span>
-    <span>{:.1}</span>
-  </div>
-  <div class="status-item">
-    <span class="status-key">Filter pass rate</span>
-    <span>{:.1}%</span>
-  </div>
+  <div class="status-item"><span class="status-key">Bot mode</span><span style="color:{dry_col}">{dry_msg}</span></div>
+  <div class="status-item"><span class="status-key">Collection started</span><span>{started_str}</span></div>
+  <div class="status-item"><span class="status-key">Tokens/hour</span><span>{tph:.1}</span></div>
+  <div class="status-item"><span class="status-key">Filter pass rate</span><span>{fpr:.1}%</span></div>
 </div>
 
-<!-- Progress bar -->
 <div class="prog-wrap">
   <div class="prog-header">
     <span style="color:#9945FF;font-weight:bold">Data Collection Progress</span>
@@ -323,99 +300,46 @@ th{{background:#1a1a2e;color:#9945FF;font-size:.7em;text-transform:uppercase;let
   <div class="prog-eta">{eta_label}</div>
 </div>
 
-<!-- Metric cards -->
 <div class="grid">
-  <div class="card">
-    <div class="label">Hours of data</div>
-    <div class="val" style="color:#9945FF">{:.1} h</div>
-    <div class="sub">target: 336 h (2 weeks)</div>
-  </div>
-  <div class="card">
-    <div class="label">Tokens monitored</div>
-    <div class="val">{}</div>
-    <div class="sub">total in DB</div>
-  </div>
-  <div class="card">
-    <div class="label">Tokens labeled</div>
-    <div class="val" style="color:#00ff88">{}</div>
-    <div class="sub">{:.1}% of total</div>
-  </div>
-  <div class="card">
-    <div class="label">Positive labels</div>
-    <div class="val" style="color:#00ff88">{}</div>
-    <div class="sub">{:.1}% pump rate</div>
-  </div>
-  <div class="card">
-    <div class="label">Negative labels</div>
-    <div class="val" style="color:#ff4444">{}</div>
-    <div class="sub">rug/dump/inactive</div>
-  </div>
-  <div class="card">
-    <div class="label">Total signals</div>
-    <div class="val">{}</div>
-    <div class="sub">all sources</div>
-  </div>
-  <div class="card">
-    <div class="label">Passed filter</div>
-    <div class="val" style="color:#ffd700">{}</div>
-    <div class="sub">qualify for trading</div>
-  </div>
+  <div class="card"><div class="label">Hours of data</div><div class="val" style="color:#9945FF">{hod:.1} h</div><div class="sub">target: 336 h (2 weeks)</div></div>
+  <div class="card"><div class="label">Tokens monitored</div><div class="val">{tot}</div><div class="sub">total in DB</div></div>
+  <div class="card"><div class="label">Tokens labeled</div><div class="val" style="color:#00ff88">{lab}</div><div class="sub">{labeled_pct:.1}% of total</div></div>
+  <div class="card"><div class="label">Positive labels</div><div class="val" style="color:#00ff88">{pos}</div><div class="sub">{pos_pct:.1}% pump rate</div></div>
+  <div class="card"><div class="label">Negative labels</div><div class="val" style="color:#ff4444">{neg}</div><div class="sub">rug/dump/inactive</div></div>
+  <div class="card"><div class="label">Total signals</div><div class="val">{sigt}</div><div class="sub">all sources</div></div>
+  <div class="card"><div class="label">Passed filter</div><div class="val" style="color:#ffd700">{pasf}</div><div class="sub">qualify for trading</div></div>
 </div>
 
-<!-- Signal source breakdown -->
 <h2>Signal Sources</h2>
 <div style="background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:18px;margin-bottom:22px">
-  <div class="src-row">
-    <span class="src-label">Twitter</span>
-    <div class="src-track"><div class="src-fill" style="width:{}px;background:#1da1f2"></div></div>
-    <span class="src-cnt">{}</span>
-  </div>
-  <div class="src-row">
-    <span class="src-label">Telegram</span>
-    <div class="src-track"><div class="src-fill" style="width:{}px;background:#0088cc"></div></div>
-    <span class="src-cnt">{}</span>
-  </div>
-  <div class="src-row">
-    <span class="src-label">Yellowstone</span>
-    <div class="src-track"><div class="src-fill" style="width:{}px;background:#9945FF"></div></div>
-    <span class="src-cnt">{}</span>
-  </div>
-  <div class="src-row">
-    <span class="src-label">Copy Trade</span>
-    <div class="src-track"><div class="src-fill" style="width:{}px;background:#00ff88"></div></div>
-    <span class="src-cnt">{}</span>
-  </div>
+  <div class="src-row"><span class="src-label">Twitter</span><div class="src-track"><div class="src-fill" style="width:{tw_w}px;background:#1da1f2"></div></div><span class="src-cnt">{tw_n}</span></div>
+  <div class="src-row"><span class="src-label">Telegram</span><div class="src-track"><div class="src-fill" style="width:{tg_w}px;background:#0088cc"></div></div><span class="src-cnt">{tg_n}</span></div>
+  <div class="src-row"><span class="src-label">Yellowstone</span><div class="src-track"><div class="src-fill" style="width:{ys_w}px;background:#9945FF"></div></div><span class="src-cnt">{ys_n}</span></div>
+  <div class="src-row"><span class="src-label">Copy Trade</span><div class="src-track"><div class="src-fill" style="width:{ct_w}px;background:#00ff88"></div></div><span class="src-cnt">{ct_n}</span></div>
 </div>
 
-<!-- Top rejection reasons -->
 <h2>Top Filter Rejection Reasons</h2>
 <table>
   <tr><th>#</th><th>Reason</th><th>Frequency</th><th>Count</th></tr>
-  {rej_rows}
+  {rej_rows}{empty_rej}
 </table>
-{empty_rej}
 
-<!-- Training action -->
 <h2>Next Steps</h2>
 <div style="background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:18px">
-  <p style="font-size:.83em;color:#888;margin-bottom:10px">
-    Once you reach 336 h, run the full training pipeline from your server:
-  </p>
+  <p style="font-size:.83em;color:#888;margin-bottom:10px">Once you reach 336 h, run the full training pipeline from your server:</p>
   <pre style="background:#0d0d14;padding:14px;border-radius:6px;font-size:.78em;overflow-x:auto;color:#ccc">source .venv/bin/activate
 python ml/scripts/outcome_tracker.py &amp;   # label outcomes (keep running)
 python ml/scripts/train_all.py           # tabular + transformer
 python ml/scripts/train_gnn.py           # graph neural network
 python ml/scripts/train_nlp.py           # FinBERT sentiment
 python ml/scripts/gnn_sidecar.py &amp;       # real-time GNN service</pre>
-  <button class="{btn_disabled}train-btn" title="{train_btn_title}" onclick="startTraining()">{train_btn_label}</button>
+  <button class="train-btn" {train_btn_disabled} title="{train_btn_title}" onclick="startTraining()">{train_btn_label}</button>
 </div>
 
-<div class="foot">Auto-refresh 10 s &nbsp;|&nbsp; {}</div>
+<div class="foot">Auto-refresh 10 s &nbsp;|&nbsp; {footer_ts}</div>
 
 <script>
-// Client-side auto-refresh with fetch for smoother updates
 setTimeout(() => location.reload(), 10000);
-
 function startTraining() {{
   fetch('/api/training/start', {{method:'POST'}})
     .then(r => r.text())
@@ -424,33 +348,38 @@ function startTraining() {{
 }}
 </script>
 </body></html>"#,
-        // status strip
-        ts.tokens_per_hour,
-        ts.filter_pass_rate * 100.0,
-        // progress bar — already handled by pct_int / eta_label above
-        // metric cards
-        ts.hours_of_data,
-        ts.total_tokens,
-        ts.labeled_tokens, labeled_pct,
-        ts.positive_labels, pos_pct,
-        ts.negative_labels,
-        ts.total_signals,
-        ts.tokens_passed_filter,
-        // signal bars
-        tw_w, ts.twitter_signals,
-        tg_w, ts.telegram_signals,
-        ys_w, ts.yellowstone_signals,
-        ct_w, ts.copy_trade_signals,
-        // rejection rows (already formatted)
-        if ts.top_rejections.is_empty() {
-            "<tr><td colspan='4' style='color:#444;text-align:center;padding:20px'>No filter data yet — tokens are still being collected</td></tr>"
-        } else { "" },
-        // train button
-        if ready { "" } else { "disabled-" },
-        train_btn_title,
-        if ready { "🚀 Start Training Now" } else { "⏳ Still collecting…" },
-        // footer timestamp
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        train_btn_style   = train_btn_style,
+        dry_col           = dry_col,
+        dry_msg           = dry_msg,
+        started_str       = started_str,
+        tph               = ts.tokens_per_hour,
+        fpr               = ts.filter_pass_rate * 100.0,
+        bar_col           = bar_col,
+        pct_int           = pct_int,
+        eta_label         = eta_label,
+        hod               = ts.hours_of_data,
+        tot               = ts.total_tokens,
+        lab               = ts.labeled_tokens,
+        labeled_pct       = labeled_pct,
+        pos               = ts.positive_labels,
+        pos_pct           = pos_pct,
+        neg               = ts.negative_labels,
+        sigt              = ts.total_signals,
+        pasf              = ts.tokens_passed_filter,
+        tw_w              = tw_w,
+        tw_n              = ts.twitter_signals,
+        tg_w              = tg_w,
+        tg_n              = ts.telegram_signals,
+        ys_w              = ys_w,
+        ys_n              = ts.yellowstone_signals,
+        ct_w              = ct_w,
+        ct_n              = ts.copy_trade_signals,
+        rej_rows          = rej_rows,
+        empty_rej         = empty_rej,
+        train_btn_disabled = train_btn_disabled,
+        train_btn_title   = train_btn_title,
+        train_btn_label   = train_btn_label,
+        footer_ts         = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
     ))
 }
 

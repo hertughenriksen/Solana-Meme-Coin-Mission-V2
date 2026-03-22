@@ -14,7 +14,13 @@ impl RedisClient {
     pub async fn set_open_position(&self, mint: &str, trade: &Trade) -> Result<()> {
         let mut c = self.conn.clone();
         let _: () = c.set(format!("position:{}", mint), serde_json::to_string(trade)?).await?;
-        let _: () = c.incr_by_float("capital_at_risk", trade.entry_amount_sol).await?;
+        // FIX: redis crate has no incr_by_float on AsyncCommands.
+        // Use the raw INCRBYFLOAT command instead.
+        let _: () = redis::cmd("INCRBYFLOAT")
+            .arg("capital_at_risk")
+            .arg(trade.entry_amount_sol)
+            .query_async(&mut c)
+            .await?;
         Ok(())
     }
 
@@ -23,7 +29,12 @@ impl RedisClient {
         let key = format!("position:{}", mint);
         if let Ok(json) = c.get::<_, String>(&key).await {
             if let Ok(trade) = serde_json::from_str::<Trade>(&json) {
-                let _: () = c.incr_by_float("capital_at_risk", -trade.entry_amount_sol).await.unwrap_or(());
+                let _: () = redis::cmd("INCRBYFLOAT")
+                    .arg("capital_at_risk")
+                    .arg(-trade.entry_amount_sol)
+                    .query_async(&mut c)
+                    .await
+                    .unwrap_or(());
             }
         }
         let _: () = c.del(&key).await?;
@@ -124,12 +135,7 @@ impl RedisClient {
             .and_then(|s| s.parse().ok())
     }
 
-    /// FIX: TTL raised from 2 s to 10 s.
-    /// The price feed polls every 2 s; a 2 s TTL caused a race condition where
-    /// the key could expire just before position management read it, making
-    /// every price read return None and disabling all TP/SL logic.
-    /// A 10 s TTL is still short enough to stay fresh while being resilient
-    /// to a single missed poll cycle.
+    /// TTL is 10 s — resilient to a single missed 2 s poll cycle.
     pub async fn set_cached_price(&self, mint: &str, price: f64) -> Result<()> {
         let mut c = self.conn.clone();
         let _: () = c.set_ex(format!("price:{}", mint), price.to_string(), 10).await?;

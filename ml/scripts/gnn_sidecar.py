@@ -2,14 +2,8 @@
 Reads TokenSignal graph data from Redis, runs TGAT inference,
 writes rug probability score back for the Rust bot to read.
 Start: python ml/scripts/gnn_sidecar.py
-
-FIX: `from train_gnn import` failed with ModuleNotFoundError unless the
-     scripts directory was already on sys.path.  We now insert the directory
-     containing this file at position 0 before any local imports.
 """
 import sys, os
-# Insert the directory that contains this script so `import train_gnn` works
-# regardless of the working directory from which the sidecar is launched.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import asyncio, json, logging
@@ -28,7 +22,7 @@ SCORE_TTL    = 300
 NODE_DIM = 12; EDGE_DIM = 4
 
 async def main():
-    from train_gnn import WalletGATN, node_features, edge_features  # noqa: E402
+    from train_gnn import WalletGATN, node_features, edge_features
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = WalletGATN().to(device)
     if os.path.exists(MODEL_PATH):
@@ -51,16 +45,15 @@ async def main():
             mint = payload.get('mint', '')
             if not mint: continue
             graph_data = payload.get('graph_data', {})
-            # Import inside loop so hot-reload of train_gnn works without restart.
-            from train_gnn import node_features as nf, edge_features as ef  # noqa: F811
+            from train_gnn import node_features as nf, edge_features as ef
             score = score_signal(model, device, graph_data, mint, nf, ef)
             await r.setex(f"{SCORE_PREFIX}{mint}", SCORE_TTL, str(score))
-            log.debug(f"Scored {mint[:8]} → {score:.3f}")
+            log.debug(f"Scored {mint[:8]} -> {score:.3f}")
         except Exception as e:
             log.error(f"GNN sidecar error: {e}")
 
 def score_signal(model, device, graph_data, mint, node_features, edge_features):
-    from torch_geometric.data import Data, Batch  # noqa: E402
+    from torch_geometric.data import Data, Batch
     wallets      = graph_data.get('wallets', {})
     transactions = graph_data.get('transactions', [])
     launch_time  = graph_data.get('launch_timestamp', 0)

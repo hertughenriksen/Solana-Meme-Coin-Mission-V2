@@ -75,12 +75,7 @@ async def compute_label(session, mint, launch_time):
     return 0, "survived_no_pump", peak_mult
 
 async def update_wallet_stats(conn):
-    """Update win-rate stats for copy-trade wallets.
-
-    FIX: the original query referenced a non-existent 'source_wallet' column on
-    the trades table.  We now join through signals.source_wallet which is
-    populated by the Rust bot when it logs copy-trade signals (migration 002).
-    """
+    """Update win-rate stats for copy-trade wallets via signals.source_wallet join."""
     await conn.execute("""
         UPDATE copy_wallets cw
         SET

@@ -36,11 +36,8 @@ impl WalletTracker {
             return Ok(());
         }
 
-        // Full gRPC wallet subscription requires yellowstone-grpc-client.
-        // When Helius gRPC is configured, this subscribes to transactions from
-        // copy_wallets specifically and emits SmartWalletBuy signals.
         warn!("Wallet tracker: gRPC not yet implemented — configure Yellowstone gRPC to enable");
-        let _ = &self.signal_tx; // keep field live
+        let _ = &self.signal_tx;
         tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         Ok(())
     }

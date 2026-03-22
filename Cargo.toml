@@ -18,7 +18,9 @@ futures      = "0.3"
 # ── Solana SDK ─────────────────────────────────────────────────────────────────
 solana-sdk                   = "2.0"
 spl-token                    = "6.0"
-spl-associated-token-account = { version = "6.0", features = ["no-entrypoint"] }
+# FIX: spl-associated-token-account 6.x does not exist on crates.io.
+# The correct version compatible with solana-sdk 2.0 is 4.x.
+spl-associated-token-account = { version = "4.0", features = ["no-entrypoint"] }
 
 # ── Yellowstone gRPC (Geyser real-time stream) ────────────────────────────────
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", optional = true }
@@ -35,7 +37,9 @@ base64     = "0.21"
 sqlx  = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros"
 ] }
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+# FIX: redis 0.24 lacks incr_by_float on AsyncCommands. Use 0.25 which exposes
+# the raw cmd() builder needed for INCRBYFLOAT.
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
 reqwest = { version = "0.11", features = ["json", "stream"] }

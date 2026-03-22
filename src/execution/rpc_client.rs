@@ -37,7 +37,6 @@ impl SolanaRpcClient {
         Self { http, config, cache: Arc::new(RwLock::new(None)) }
     }
 
-    /// Spawns a background task that refreshes the cached blockhash every 15 s.
     pub fn spawn_blockhash_refresher(self: &Arc<Self>) {
         let client = Arc::clone(self);
         tokio::spawn(async move {
@@ -148,7 +147,6 @@ impl SolanaRpcClient {
         Ok(list)
     }
 
-    /// Helius DAS API — metadata, token extensions, etc.
     pub async fn get_asset_info(&self, mint: &str) -> Result<Value> {
         let url = format!(
             "https://mainnet.helius-rpc.com/?api-key={}",
