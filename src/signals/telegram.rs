@@ -79,22 +79,26 @@ impl TelegramScanner {
 
         let api_id: i32 = cfg.api_id.parse().context("Telegram API ID must be a number")?;
 
-        // ── grammers fa7692e API ──────────────────────────────────────────────
-        // At this commit the public surface is:
-        //   Client::connect(InitParams) -> Result<Client>
-        //   InitParams { api_id, api_hash, session, .. Default::default() }
-        //   session is grammers_session::Session (not a trait — it's a struct)
+        // ── grammers 0.8.x API ────────────────────────────────────────────────
+        // Requires the latest HEAD of https://github.com/Lonami/grammers
+        // (Cargo.toml: no rev pin so cargo uses the stable 0.8 branch).
+        //
+        // Public surface used here:
+        //   grammers_client::{Client, Config, InitParams}
+        //   grammers_session::Session  (concrete struct, not a trait)
+        //   Session::load(&[u8]) -> Result<Session>
+        //   Session::new() -> Session
+        //   Client::connect(Config) -> Result<Client>
         //   client.is_authorized() -> Result<bool>
         //   client.resolve_username(&str) -> Result<Option<Chat>>
         //   chat.id() -> i64
         //   client.next_update() -> Result<Update>
-        //   Update is an enum with NewMessage(Message), MessageEdited(Message) variants
-        //   client.request_login_code(phone, api_id, api_hash) -> Result<LoginToken>
+        //   grammers_client::Update enum variants: NewMessage(Message), MessageEdited(Message)
+        //   client.request_login_code(phone, api_hash) -> Result<LoginToken>  [2 args]
         //   client.sign_in(&LoginToken, &str) -> Result<User, SignInError>
         //   SignInError::PasswordRequired(PasswordToken)
         //   client.check_password(PasswordToken, &str) -> Result<User>
-        //   client.session() -> &Session   (saves internally, not to file directly)
-        //   Session has no save_to_file; use std::fs::write + session.save()
+        //   client.session().save() -> Vec<u8>
 
         use grammers_client::{Client, Config as GrammersConfig, InitParams};
         use grammers_session::Session;
@@ -121,17 +125,21 @@ impl TelegramScanner {
             info!("Telegram: not authorized — starting phone auth flow");
             self.authorize(&client, &cfg.phone, api_id, &cfg.api_hash, session_path).await?;
         } else {
-            // Save fresh session data
             self.save_session(&client, session_path)?;
         }
 
         info!("✅ Telegram authenticated");
 
+        // FIX: Update enum lives at grammers_client::Update (re-exported at crate root
+        // in 0.8.x).  Import here so the match arms below can reference it.
+        use grammers_client::Update;
+
         let mut group_states: HashMap<i64, GroupState> = HashMap::new();
         for group_username in &cfg.groups {
             match client.resolve_username(group_username).await {
                 Ok(Some(entity)) => {
-                    let chat_id = entity.id();
+                    // FIX: annotate the type so rustc does not have to guess
+                    let chat_id: i64 = entity.id();
                     group_states.insert(chat_id, GroupState::new());
                     info!("  ✓ Watching group: @{} (id: {})", group_username, chat_id);
                 }
@@ -145,11 +153,14 @@ impl TelegramScanner {
         loop {
             match client.next_update().await {
                 Ok(update) => {
-                    use grammers_client::Update;
-                    let msg_opt = match update {
+                    // FIX: explicit type annotation on msg_opt to resolve ambiguity
+                    // for the `text.is_empty()` call further below.
+                    let msg_opt: Option<(i64, String, i32)> = match update {
                         Update::NewMessage(ref msg) | Update::MessageEdited(ref msg) => {
                             if msg.outgoing() { None }
-                            else { Some((msg.chat().id(), msg.text().to_string(), msg.id())) }
+                            else {
+                                Some((msg.chat().id(), msg.text().to_string(), msg.id()))
+                            }
                         }
                         _ => None,
                     };
@@ -167,7 +178,9 @@ impl TelegramScanner {
                         }
                     }
                 }
-                Err(e) => return Err(e.into()),
+                // FIX: convert the grammers error to anyhow explicitly to avoid
+                // the E0282 "cannot infer type" from a bare `.into()`.
+                Err(e) => return Err(anyhow::anyhow!("Telegram update error: {}", e)),
             }
         }
     }
@@ -250,7 +263,7 @@ impl TelegramScanner {
     }
 
     fn save_session(&self, client: &grammers_client::Client, path: &str) -> Result<()> {
-        // grammers fa7692e: client.session() returns &Session; Session::save() serialises it
+        // grammers 0.8.x: client.session() returns &Session; Session::save() → Vec<u8>
         let session_data = client.session().save();
         std::fs::write(path, &session_data)?;
         Ok(())
@@ -260,13 +273,14 @@ impl TelegramScanner {
         &self,
         client:       &grammers_client::Client,
         phone:        &str,
-        api_id:       i32,
+        _api_id:      i32,   // FIX: api_id is no longer a parameter of request_login_code
         api_hash:     &str,
         session_path: &str,
     ) -> Result<()> {
         use std::io::{self, BufRead, Write};
-        // FIX: request_login_code takes (phone, api_id, api_hash) in fa7692e
-        let token = client.request_login_code(phone, api_id, api_hash).await?;
+        // FIX: grammers 0.8.x request_login_code takes (phone, api_hash) — 2 args.
+        // The original code incorrectly passed api_id as the second argument.
+        let token = client.request_login_code(phone, api_hash).await?;
         print!("Enter Telegram verification code: ");
         io::stdout().flush()?;
         let mut code = String::new();

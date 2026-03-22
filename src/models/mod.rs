@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{Datelike, Timelike};   // FIX: Datelike needed for .weekday()
 use ndarray::{Array2, Array3};
-// FIX: ort rc.12 moved types — correct import paths:
+// FIX: ort rc.12 correct import paths
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use std::f32::consts::PI as PI32;
@@ -63,18 +63,23 @@ impl ModelEnsemble {
         tokio::task::spawn_blocking(move || {
             let arr = Array2::<f32>::from_shape_vec((1, N_TABULAR), feats)
                 .map_err(|e| anyhow::anyhow!("Array shape: {}", e))?;
-            // FIX: ort rc.12 requires Tensor::from_array, not raw ndarray views
-            let input = Tensor::from_array(arr.view())
+            // FIX: Tensor::from_array requires an owned Array, not a view.
+            // Pass `arr` directly (moved), not `arr.view()`.
+            let input = Tensor::from_array(arr)
                 .map_err(|e| anyhow::anyhow!("Tensor create: {}", e))?;
-            let outputs = sess.run(ort::inputs![input]?)
+            // FIX: ort::inputs![...] returns [SessionInputValue; N] directly, not a Result.
+            // The `?` must be applied to sess.run(...), not to the inputs! macro.
+            let outputs = sess.run(ort::inputs![input])
                 .map_err(|e| anyhow::anyhow!("Tabular run: {}", e))?;
+            // FIX: use outputs.len() — SessionOutputs does not have is_empty() in scope
+            // without importing the ark-std Iterable trait.
             let prob = if outputs.len() >= 2 {
                 let t = outputs[1].try_extract_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
                 let v = t.view();
                 if v.ndim() == 2 && v.shape()[1] >= 2 { v[[0, 1]] as f64 }
                 else { v.iter().copied().next().unwrap_or(0.5) as f64 }
-            } else if !outputs.is_empty() {
+            } else if outputs.len() > 0 {
                 let t = outputs[0].try_extract_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
                 t.view().iter().copied().next().unwrap_or(0.5) as f64
@@ -104,9 +109,11 @@ impl ModelEnsemble {
         tokio::task::spawn_blocking(move || {
             let seq = build_price_sequence(&owned)
                 .ok_or_else(|| anyhow::anyhow!("Empty candles"))?;
-            let input = Tensor::from_array(seq.view())
+            // FIX: owned Array3, not .view()
+            let input = Tensor::from_array(seq)
                 .map_err(|e| anyhow::anyhow!("Tensor: {}", e))?;
-            let outputs = sess.run(ort::inputs![input]?)
+            // FIX: no ? after ort::inputs![...]
+            let outputs = sess.run(ort::inputs![input])
                 .map_err(|e| anyhow::anyhow!("Transformer run: {}", e))?;
             let t = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
@@ -128,14 +135,18 @@ impl ModelEnsemble {
         tokio::task::spawn_blocking(move || {
             let arr = Array2::<f32>::from_shape_vec((1, NODE_DIM), node_feats.to_vec())
                 .map_err(|e| anyhow::anyhow!("GNN array: {}", e))?;
-            let input = Tensor::from_array(arr.view())
+            // FIX: owned array, not .view()
+            let input = Tensor::from_array(arr)
                 .map_err(|e| anyhow::anyhow!("GNN tensor: {}", e))?;
-            let outputs = sess.run(ort::inputs!["node_features" => input]?)
+            // FIX: named inputs — ort::inputs![...] returns Vec<...>, not a Result;
+            // remove ? from the macro invocation.
+            let outputs = sess.run(ort::inputs!["node_features" => input])
                 .map_err(|e| anyhow::anyhow!("GNN run: {}", e))?;
             let t = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("GNN extract: {}", e))?;
             let rug_prob = t.view().iter().copied().next().unwrap_or(0.5) as f64;
-            Ok((1.0 - rug_prob).clamp(0.0, 1.0))
+            // FIX: annotate float literal to resolve ambiguous numeric type for clamp
+            Ok((1.0_f64 - rug_prob).clamp(0.0, 1.0))
         }).await?
     }
 
@@ -163,14 +174,17 @@ impl ModelEnsemble {
             let ids_arr   = Array2::<i64>::from_shape_vec((1, MAX_NLP_LEN), ids)?;
             let mask_arr  = Array2::<i64>::from_shape_vec((1, MAX_NLP_LEN), mask)?;
             let types_arr = Array2::<i64>::from_shape_vec((1, MAX_NLP_LEN), types)?;
-            let t_ids   = Tensor::from_array(ids_arr.view()).map_err(|e| anyhow::anyhow!("{}", e))?;
-            let t_mask  = Tensor::from_array(mask_arr.view()).map_err(|e| anyhow::anyhow!("{}", e))?;
-            let t_types = Tensor::from_array(types_arr.view()).map_err(|e| anyhow::anyhow!("{}", e))?;
+            // FIX: owned arrays (not .view()) — OwnedTensorArrayData is not implemented
+            // for ViewRepr; only for OwnedRepr.
+            let t_ids   = Tensor::from_array(ids_arr).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let t_mask  = Tensor::from_array(mask_arr).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let t_types = Tensor::from_array(types_arr).map_err(|e| anyhow::anyhow!("{}", e))?;
+            // FIX: no ? after ort::inputs![...]; the macro returns Vec<...> directly.
             let outputs = sess.run(ort::inputs![
                 "input_ids"      => t_ids,
                 "attention_mask" => t_mask,
                 "token_type_ids" => t_types
-            ]?).map_err(|e| anyhow::anyhow!("NLP run: {}", e))?;
+            ]).map_err(|e| anyhow::anyhow!("NLP run: {}", e))?;
             let t = outputs[0].try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("NLP extract: {}", e))?;
             Ok((t.view().iter().copied().next().unwrap_or(0.5) as f64).clamp(0.0, 1.0))
@@ -347,12 +361,26 @@ fn load_session(path: &str, name: &str) -> Option<Arc<Session>> {
         warn!("ONNX model '{}' not found at {} — heuristic active", name, path);
         return None;
     }
-    // FIX: Session::builder() returns a SessionBuilder directly (not Result) in rc.12;
-    // chain with_optimization_level and commit_from_file, both return Result.
-    match Session::builder()
-        .and_then(|b: ort::session::SessionBuilder| b.with_optimization_level(GraphOptimizationLevel::Level3))
-        .and_then(|b| b.commit_from_file(path))
-    {
+    // FIX: Use an immediately-invoked closure with ? operators to avoid the
+    // two issues in the original .and_then() chain:
+    //   1. `SessionBuilder` is private at `ort::session::SessionBuilder`; the
+    //      public path is `ort::session::builder::SessionBuilder`.
+    //   2. `with_optimization_level` returns `Result<SB, Error<SB>>` while
+    //      `and_then` expected `Result<_, Error<()>>` — mismatched error params.
+    // The closure approach sidesteps both by mapping each error to anyhow.
+    let result = (|| -> anyhow::Result<Session> {
+        let builder = Session::builder()
+            .map_err(|e| anyhow::anyhow!("Session builder: {}", e))?;
+        let builder = builder
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("Optimization level: {}", e))?;
+        let session = builder
+            .commit_from_file(path)
+            .map_err(|e| anyhow::anyhow!("Load model file '{}': {}", path, e))?;
+        Ok(session)
+    })();
+
+    match result {
         Ok(s)  => { info!("✅ ONNX model loaded: {} ({})", name, path); Some(Arc::new(s)) }
         Err(e) => { warn!("Failed to load ONNX '{}': {} — heuristic active", name, e); None }
     }

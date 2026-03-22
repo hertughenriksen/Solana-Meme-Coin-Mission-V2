@@ -32,7 +32,6 @@ borsh      = { version = "1.3", features = ["derive"] }
 base64     = "0.21"
 
 # ── Database ───────────────────────────────────────────────────────────────────
-# FIX: "migrate" feature added — required for sqlx::migrate! macro
 sqlx  = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros", "migrate"
 ] }
@@ -42,7 +41,6 @@ redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 
 # ── ML inference (ONNX runtime) ────────────────────────────────────────────────
-# FIX: pinned to rc.12 — the version cargo actually resolved at build time
 ort     = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 ndarray = "0.15"
 
@@ -50,11 +48,13 @@ ndarray = "0.15"
 tokenizers = { version = "0.19", default-features = false, features = ["onig"] }
 
 # ── Telegram MTProto ───────────────────────────────────────────────────────────
-# FIX: pinned to commit fa7692e — the exact revision cargo resolved.
-# The grammers API (Client::connect, types::Update, session saving) changed
-# between commits; pinning prevents surprise breakage on next git pull.
-grammers-client  = { git = "https://github.com/Lonami/grammers", rev = "fa7692e", package = "grammers-client" }
-grammers-session = { git = "https://github.com/Lonami/grammers", rev = "fa7692e", package = "grammers-session" }
+# FIX: removed rev = "fa7692e" — that commit pre-dates the stable 0.8 API surface
+# (Config, InitParams, Client::connect, Update enum at crate root).  Without a
+# rev pin cargo resolves the latest HEAD of the main branch which has the full
+# 0.8 API that the code expects.  Delete Cargo.lock and run `cargo update` after
+# applying this change so the new revision is fetched.
+grammers-client  = { git = "https://github.com/Lonami/grammers", package = "grammers-client" }
+grammers-session = { git = "https://github.com/Lonami/grammers", package = "grammers-session" }
 
 # ── Monitoring ─────────────────────────────────────────────────────────────────
 axum                        = "0.7"
