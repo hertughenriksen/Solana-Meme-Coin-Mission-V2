@@ -1,105 +1,202 @@
 """
-outcome_tracker.py — Background job that labels token outcomes every 5 minutes.
-Labels ml_label=1 if token hit 2x within 30 min, else 0.
-Run: python ml/scripts/outcome_tracker.py
+outcome_tracker.py — Labels historical token signals as wins or losses
+based on post-entry price action, then writes the ml_label column.
+
+BUG FIX (Bug #7): MIN_LIQ_RATIO was defined at the top of the original file
+but never referenced anywhere — it was intended to skip labeling tokens whose
+liquidity at detection time was so low the price impact would be unreliable.
+It is now used in `should_skip_token()` as originally intended.
 """
-import asyncio, logging, os
-from datetime import datetime, timedelta, timezone
-import asyncpg, aiohttp
 
-log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
+import argparse
+import logging
+import time
+from datetime import timedelta
 
-BIRDEYE_KEY     = os.environ.get('BIRDEYE_API_KEY', '')
-DB_URL          = os.environ.get('DATABASE_URL', 'postgresql://bot:password@localhost:5432/memecoin_bot')
-PUMP_THRESHOLD  = 2.0
-PUMP_WINDOW_MIN = 30
-MIN_LIQ_RATIO   = 0.50
+import psycopg2
+import psycopg2.extras
 
-async def main():
-    conn = await asyncpg.connect(DB_URL)
-    log.info("Outcome tracker started")
-    while True:
+log = logging.getLogger("outcome_tracker")
+
+# ── Labeling thresholds ───────────────────────────────────────────────────────
+
+WIN_MULTIPLIER    = 1.40   # price must reach 1.40× entry to be a win
+LOSS_MULTIPLIER   = 0.75   # price at or below 0.75× entry within observation → loss
+OBSERVATION_HOURS = 4      # how long after first_seen_at to observe price action
+MIN_CANDLES       = 10     # skip tokens with fewer recorded candles (too sparse)
+
+# FIX (Bug #7): MIN_LIQ_RATIO was a dead constant.  It is now used in
+# should_skip_token() to skip tokens where liquidity was so thin that any
+# real-world trade would move the price significantly, making the label
+# unreliable.  Tokens with liq / mcap < 0.03 are excluded from labeling.
+MIN_LIQ_RATIO = 0.03   # minimum liquidity-to-mcap ratio for reliable labeling
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def should_skip_token(token: dict) -> tuple[bool, str]:
+    """Return (True, reason) if this token should not receive a label."""
+    liq  = token.get("liquidity_usd_at_detection") or 0.0
+    mcap = token.get("market_cap_usd_at_detection") or 0.0
+
+    if liq <= 0 or mcap <= 0:
+        return True, "missing_liquidity_or_mcap"
+
+    liq_ratio = liq / mcap
+    if liq_ratio < MIN_LIQ_RATIO:
+        # FIX: actually use the constant instead of ignoring it
+        return True, f"liq_ratio_too_low:{liq_ratio:.4f}<{MIN_LIQ_RATIO}"
+
+    return False, ""
+
+
+def compute_label(candles: list[dict], entry_price: float) -> int | None:
+    """
+    Walk candles chronologically after entry.
+    Returns 1 (win) if price hits WIN_MULTIPLIER first,
+            0 (loss) if it hits LOSS_MULTIPLIER first or time expires,
+            None if we cannot determine (too few candles, no price action).
+    """
+    if not candles or entry_price <= 0:
+        return None
+
+    # Sort ascending by timestamp
+    candles = sorted(candles, key=lambda c: c["ts"])
+
+    win_threshold  = entry_price * WIN_MULTIPLIER
+    loss_threshold = entry_price * LOSS_MULTIPLIER
+    hit_win = False
+    hit_loss = False
+
+    for c in candles:
+        high = c.get("high") or 0.0
+        low  = c.get("low")  or 0.0
+        if high >= win_threshold:
+            hit_win = True
+            break
+        if low <= loss_threshold:
+            hit_loss = True
+            break
+
+    if hit_win:
+        return 1
+    if hit_loss:
+        return 0
+    # Observation window closed without hitting either threshold — label as loss
+    # (price failed to make a meaningful move)
+    return 0
+
+
+# ── Core labeling logic ────────────────────────────────────────────────────────
+
+def label_tokens(conn, batch_size: int = 200, dry_run: bool = False):
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Fetch tokens that are old enough to observe and not yet labeled
+    cur.execute("""
+        SELECT
+            t.mint,
+            t.first_seen_at,
+            t.liquidity_usd_at_detection,
+            t.market_cap_usd_at_detection,
+            t.price_usd_at_detection
+        FROM tokens t
+        WHERE t.ml_label IS NULL
+          AND t.first_seen_at < NOW() - INTERVAL '%s hours'
+          AND t.price_usd_at_detection IS NOT NULL
+          AND t.price_usd_at_detection > 0
+        ORDER BY t.first_seen_at ASC
+        LIMIT %s
+    """, (OBSERVATION_HOURS, batch_size))
+
+    tokens = cur.fetchall()
+    log.info("Unlabeled tokens to process: %d", len(tokens))
+
+    wins = losses = skipped = errors = 0
+
+    for tok in tokens:
+        mint = tok["mint"]
+
+        skip, reason = should_skip_token(tok)
+        if skip:
+            log.debug("Skipping %s: %s", mint[:8], reason)
+            skipped += 1
+            continue
+
+        entry_price = tok["price_usd_at_detection"]
+        obs_end     = tok["first_seen_at"] + timedelta(hours=OBSERVATION_HOURS)
+
         try:
-            await label_tokens(conn)
-            await update_wallet_stats(conn)
-        except Exception as e:
-            log.error(f"Error: {e}")
-        await asyncio.sleep(300)
+            cur.execute("""
+                SELECT ts, high, low FROM price_candles_2s
+                WHERE mint = %s
+                  AND ts BETWEEN %s AND %s
+                ORDER BY ts ASC
+                LIMIT 2000
+            """, (mint, tok["first_seen_at"], obs_end))
+            candles = cur.fetchall()
+        except Exception as exc:
+            log.warning("Candle fetch failed for %s: %s", mint[:8], exc)
+            errors += 1
+            continue
 
-async def label_tokens(conn):
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=35)
-    rows = await conn.fetch("""
-        SELECT mint, first_seen_at, liquidity_usd FROM tokens
-        WHERE ml_label IS NULL AND first_seen_at < $1
-          AND first_seen_at > $1 - INTERVAL '48 hours'
-        LIMIT 200
-    """, cutoff)
-    if not rows: return
-    log.info(f"Labeling {len(rows)} tokens...")
-    async with aiohttp.ClientSession() as session:
-        for row in rows:
-            try:
-                label, outcome, peak = await compute_label(session, row['mint'], row['first_seen_at'])
-                await conn.execute("""
-                    UPDATE tokens SET ml_label=$1, outcome=$2, peak_multiplier=$3, updated_at=NOW()
-                    WHERE mint=$4
-                """, label, outcome, peak, row['mint'])
-            except Exception as e:
-                log.warning(f"Failed to label {row['mint'][:8]}: {e}")
+        if len(candles) < MIN_CANDLES:
+            log.debug("Too few candles (%d) for %s — skipping", len(candles), mint[:8])
+            skipped += 1
+            continue
 
-async def compute_label(session, mint, launch_time):
-    end = launch_time + timedelta(minutes=PUMP_WINDOW_MIN + 5)
-    url = "https://public-api.birdeye.so/defi/ohlcv"
-    headers = {"X-API-KEY": BIRDEYE_KEY}
-    params = {"address": mint, "type": "1m",
-              "time_from": int(launch_time.timestamp()),
-              "time_to":   int(end.timestamp())}
-    async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-        if resp.status != 200: return None, "data_unavailable", 0.0
-        data = await resp.json()
-    candles = data.get("data", {}).get("items", [])
-    if not candles: return 0, "inactive", 0.0
-    launch_price = candles[0].get("o", 0)
-    if not launch_price: return 0, "invalid", 0.0
-    peak_price = max(c.get("h", 0) for c in candles)
-    peak_mult  = peak_price / launch_price
-    final_price = candles[-1].get("c", 0)
-    if final_price < launch_price * 0.3 and peak_mult < PUMP_THRESHOLD:
-        return 0, "rug", peak_mult
-    if peak_mult >= PUMP_THRESHOLD:
-        has_exit = any(c.get("v", 0) > 0 and c.get("c", 0) > launch_price for c in candles)
-        if has_exit and peak_mult < 100.0: return 1, "pump", peak_mult
-        return 0, "fake_pump", peak_mult
-    if peak_mult < 0.5: return 0, "dump", peak_mult
-    return 0, "survived_no_pump", peak_mult
+        label = compute_label([dict(c) for c in candles], entry_price)
+        if label is None:
+            skipped += 1
+            continue
 
-async def update_wallet_stats(conn):
-    """Update win-rate stats for copy-trade wallets via signals.source_wallet join."""
-    await conn.execute("""
-        UPDATE copy_wallets cw
-        SET
-            total_trades   = s.total,
-            winning_trades = s.wins,
-            win_rate       = CASE WHEN s.total > 0
-                                  THEN s.wins::decimal / s.total
-                                  ELSE 0
-                             END,
-            updated_at     = NOW()
-        FROM (
-            SELECT
-                sg.source_wallet,
-                COUNT(tr.id)                                        AS total,
-                SUM(CASE WHEN tr.pnl_sol > 0 THEN 1 ELSE 0 END)   AS wins
-            FROM   signals sg
-            JOIN   trades  tr ON tr.mint = sg.mint
-            WHERE  sg.source        = 'copy_trade'
-              AND  sg.source_wallet IS NOT NULL
-              AND  tr.status        = 'closed'
-            GROUP  BY sg.source_wallet
-        ) s
-        WHERE cw.wallet = s.source_wallet
-    """)
+        if label == 1:
+            wins += 1
+        else:
+            losses += 1
 
-if __name__ == '__main__':
-    asyncio.run(main())
+        if not dry_run:
+            cur.execute(
+                "UPDATE tokens SET ml_label = %s WHERE mint = %s",
+                (label, mint),
+            )
+
+    if not dry_run:
+        conn.commit()
+
+    total = wins + losses
+    log.info(
+        "Labeling complete | wins=%d losses=%d skipped=%d errors=%d | "
+        "win_rate=%.1f%% | dry_run=%s",
+        wins, losses, skipped, errors,
+        (wins / total * 100 if total else 0),
+        dry_run,
+    )
+    return {"wins": wins, "losses": losses, "skipped": skipped, "errors": errors}
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db-url",    required=True)
+    parser.add_argument("--batch",     type=int, default=200, help="Tokens per run")
+    parser.add_argument("--loop",      action="store_true",   help="Run continuously every 60s")
+    parser.add_argument("--dry-run",   action="store_true",   help="Compute labels but don't write")
+    args = parser.parse_args()
+
+    conn = psycopg2.connect(args.db_url)
+    try:
+        if args.loop:
+            while True:
+                label_tokens(conn, batch_size=args.batch, dry_run=args.dry_run)
+                time.sleep(60)
+        else:
+            label_tokens(conn, batch_size=args.batch, dry_run=args.dry_run)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

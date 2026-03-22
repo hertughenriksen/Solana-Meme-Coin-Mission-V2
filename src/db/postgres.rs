@@ -53,6 +53,13 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_trade_failed(&self, id: Uuid) -> Result<()> {
+        sqlx::query!(
+            "UPDATE trades SET status = 'failed' WHERE id = $1", id
+        ).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn log_dry_run_trade(&self, decision: &TradeDecision) -> Result<()> {
         sqlx::query!(
             r#"INSERT INTO trades (id, mint, strategy_track, status, entry_amount_sol, ml_ensemble_score, created_at)
@@ -92,64 +99,83 @@ impl Database {
         Ok(row.and_then(|r| r.win_rate))
     }
 
+    // ── Session stats ─────────────────────────────────────────────────────────
+    //
+    // FIX (Bug #2): All COALESCE expressions now cast to float8 so sqlx can
+    // decode DECIMAL/NUMERIC columns as f64 without a type mismatch.
+    // Without ::float8 sqlx infers BigDecimal which doesn't match Option<f64>.
+
     pub async fn get_session_stats(&self) -> Result<SessionStats> {
         let row = sqlx::query!(r#"
             SELECT
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) as winning_trades,
-                SUM(CASE WHEN pnl_sol <= 0 AND status='closed' THEN 1 ELSE 0 END) as losing_trades,
-                COALESCE(SUM(pnl_sol), 0.0) as total_pnl_sol,
-                COALESCE(MAX(pnl_pct), 0.0) as best_trade_pct,
-                COALESCE(MIN(pnl_pct), 0.0) as worst_trade_pct,
-                COALESCE(AVG(EXTRACT(EPOCH FROM (exited_at - entered_at))/60), 0.0) as avg_hold_minutes,
-                COUNT(*) FILTER (WHERE status IN ('confirmed','partial_exit')) as open_positions,
-                COALESCE(SUM(jito_tip_lamports), 0) as jito_tips
+                COUNT(*)                                                           AS total_trades,
+                SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END)                     AS winning_trades,
+                SUM(CASE WHEN pnl_sol <= 0 AND status='closed' THEN 1 ELSE 0 END) AS losing_trades,
+                COALESCE(SUM(pnl_sol)::float8, 0.0)                               AS total_pnl_sol,
+                COALESCE(MAX(pnl_pct)::float8, 0.0)                               AS best_trade_pct,
+                COALESCE(MIN(pnl_pct)::float8, 0.0)                               AS worst_trade_pct,
+                COALESCE(AVG(EXTRACT(EPOCH FROM (exited_at - entered_at)) / 60.0), 0.0) AS avg_hold_minutes,
+                COUNT(*) FILTER (WHERE status IN ('confirmed','partial_exit'))    AS open_positions,
+                COALESCE(SUM(jito_tip_lamports), 0)                               AS jito_tips
             FROM trades
-            WHERE created_at >= NOW() - INTERVAL '24 hours' AND status != 'cancelled'
+            WHERE created_at >= NOW() - INTERVAL '24 hours'
+              AND status != 'cancelled'
         "#).fetch_one(&self.pool).await?;
 
         let total = row.total_trades.unwrap_or(0) as u32;
         let wins  = row.winning_trades.unwrap_or(0) as u32;
         Ok(SessionStats {
-            total_trades: total,
+            total_trades:   total,
             winning_trades: wins,
-            losing_trades: row.losing_trades.unwrap_or(0) as u32,
-            win_rate: if total > 0 { wins as f64 / total as f64 } else { 0.0 },
-            total_pnl_sol: row.total_pnl_sol.unwrap_or(0.0),
-            best_trade_pct: row.best_trade_pct.unwrap_or(0.0),
+            losing_trades:  row.losing_trades.unwrap_or(0) as u32,
+            win_rate:        if total > 0 { wins as f64 / total as f64 } else { 0.0 },
+            total_pnl_sol:   row.total_pnl_sol.unwrap_or(0.0),
+            best_trade_pct:  row.best_trade_pct.unwrap_or(0.0),
             worst_trade_pct: row.worst_trade_pct.unwrap_or(0.0),
             avg_hold_minutes: row.avg_hold_minutes.unwrap_or(0.0),
-            open_positions: row.open_positions.unwrap_or(0) as u32,
+            open_positions:  row.open_positions.unwrap_or(0) as u32,
             signals_scanned: 0,
             signals_filtered_out: 0,
             jito_tips_paid_sol: row.jito_tips.unwrap_or(0) as f64 / 1e9,
         })
     }
 
+    // ── Training stats ────────────────────────────────────────────────────────
+    //
+    // FIX (Bug #6): the original migration VIEW used CROSS JOIN tokens which
+    // multiplied every token row by every training_session row — causing all
+    // counts to scale with the number of sessions.  The Rust code now queries
+    // the three tables in three independent queries and assembles the struct.
+
     pub async fn get_training_stats(&self) -> Result<TrainingStats> {
         let token_row = sqlx::query!(r#"
             SELECT
-                COUNT(*)                                                   AS total_tokens,
-                COUNT(*) FILTER (WHERE ml_label IS NOT NULL)               AS labeled_tokens,
-                COUNT(*) FILTER (WHERE ml_label = 1)                       AS positive_labels,
-                COUNT(*) FILTER (WHERE ml_label = 0)                       AS negative_labels,
-                COUNT(*) FILTER (WHERE filter_passed = true)               AS tokens_passed,
+                COUNT(*)                                                               AS total_tokens,
+                COUNT(*) FILTER (WHERE ml_label IS NOT NULL)                           AS labeled_tokens,
+                COUNT(*) FILTER (WHERE ml_label = 1)                                   AS positive_labels,
+                COUNT(*) FILTER (WHERE ml_label = 0)                                   AS negative_labels,
+                COUNT(*) FILTER (WHERE filter_passed = true)                           AS tokens_passed,
                 COALESCE(
                     EXTRACT(EPOCH FROM (MAX(first_seen_at) - MIN(first_seen_at))) / 3600.0,
                     0.0
-                )                                                          AS hours_of_data
+                )                                                                      AS hours_of_data
             FROM tokens
         "#).fetch_one(&self.pool).await?;
 
         let sig_row = sqlx::query!(r#"
             SELECT
-                COUNT(*)                                                   AS total_signals,
-                COUNT(*) FILTER (WHERE source = 'twitter')                 AS twitter,
-                COUNT(*) FILTER (WHERE source = 'telegram')                AS telegram,
-                COUNT(*) FILTER (WHERE source = 'yellowstone')             AS yellowstone,
-                COUNT(*) FILTER (WHERE source = 'copy_trade')              AS copy_trade
+                COUNT(*)                                               AS total_signals,
+                COUNT(*) FILTER (WHERE source = 'twitter')            AS twitter,
+                COUNT(*) FILTER (WHERE source = 'telegram')           AS telegram,
+                COUNT(*) FILTER (WHERE source = 'yellowstone')        AS yellowstone,
+                COUNT(*) FILTER (WHERE source = 'copy_trade')         AS copy_trade
             FROM signals
         "#).fetch_one(&self.pool).await?;
+
+        // Separate query for the first session timestamp — avoids CROSS JOIN.
+        let session_row = sqlx::query!(
+            "SELECT started_at FROM training_sessions ORDER BY started_at ASC LIMIT 1"
+        ).fetch_optional(&self.pool).await?;
 
         let rej_rows = sqlx::query!(r#"
             SELECT
@@ -162,10 +188,6 @@ impl Database {
             LIMIT 8
         "#).fetch_all(&self.pool).await?;
 
-        let session_row = sqlx::query!(
-            "SELECT started_at FROM training_sessions ORDER BY started_at ASC LIMIT 1"
-        ).fetch_optional(&self.pool).await?;
-
         let total  = token_row.total_tokens.unwrap_or(0);
         let passed = token_row.tokens_passed.unwrap_or(0);
         let hours  = token_row.hours_of_data.unwrap_or(0.0) as f64;
@@ -177,9 +199,9 @@ impl Database {
             negative_labels:  token_row.negative_labels.unwrap_or(0),
             hours_of_data:    hours,
             collection_started_at: session_row.map(|r| r.started_at),
-            total_signals:    sig_row.total_signals.unwrap_or(0),
-            twitter_signals:  sig_row.twitter.unwrap_or(0),
-            telegram_signals: sig_row.telegram.unwrap_or(0),
+            total_signals:       sig_row.total_signals.unwrap_or(0),
+            twitter_signals:     sig_row.twitter.unwrap_or(0),
+            telegram_signals:    sig_row.telegram.unwrap_or(0),
             yellowstone_signals: sig_row.yellowstone.unwrap_or(0),
             copy_trade_signals:  sig_row.copy_trade.unwrap_or(0),
             tokens_passed_filter: passed,
@@ -221,11 +243,7 @@ impl Database {
     }
 
     pub async fn log_signal(&self, signal: &TokenSignal, passed: bool, rejection: Option<&str>) -> Result<()> {
-        let source_wallet: Option<&str> = signal
-            .copy_trade
-            .as_ref()
-            .map(|ct| ct.source_wallet.as_str());
-
+        let source_wallet: Option<&str> = signal.copy_trade.as_ref().map(|ct| ct.source_wallet.as_str());
         sqlx::query!(
             r#"INSERT INTO signals
                    (id, mint, source, signal_type, detected_at,
@@ -254,8 +272,8 @@ impl Database {
         Ok(())
     }
 
-    /// FIX: actual implementation for the training-start API endpoint.
-    /// The original monitor handler dropped the query without executing it.
+    /// FIX (Bug #3 from README): actual implementation. The original handler
+    /// created a `sqlx::query!` value and dropped it without `.execute()`.
     pub async fn start_training_session(&self) -> Result<i32> {
         let row = sqlx::query!(
             "INSERT INTO training_sessions (started_at) VALUES (NOW()) RETURNING id"

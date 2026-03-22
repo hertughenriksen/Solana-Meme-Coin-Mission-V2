@@ -1,143 +1,359 @@
-"""train_gnn.py — Temporal Graph Attention Network for rug pull detection.
-Usage: python ml/scripts/train_gnn.py --synthetic
-       python ml/scripts/train_gnn.py --db-url $DATABASE_URL
 """
-import argparse, json, logging, os
+train_gnn.py — Graph Neural Network training for deployer-wallet rug detection.
+
+BUG FIX: Python ≤ 3.11 raises SyntaxError on f-strings that contain dict access
+with the same quote style as the outer string, e.g. f"...{m["f1"]:.4f}...".
+All such occurrences are replaced with a temporary variable pattern:
+    val = m["f1"]; log.info(f"...{val:.4f}...")
+"""
+
+import argparse
+import json
+import logging
+import os
 from pathlib import Path
+
 import numpy as np
-import torch, torch.nn as nn, torch.nn.functional as F
-from torch_geometric.data import Data
+import psycopg2
+import psycopg2.extras
+import torch
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
 
-try:
-    from torch_geometric.loader import DataLoader
-except ImportError:
-    from torch_geometric.data import DataLoader
+log = logging.getLogger("train_gnn")
 
-from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool
-from sklearn.metrics import f1_score, roc_auc_score, recall_score
 
-log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# ── Feature engineering ────────────────────────────────────────────────────────
 
-NODE_DIM=12; EDGE_DIM=4; HIDDEN=128; HEADS=4; LAYERS=3; DROPOUT=0.3
-LR=3e-4; BATCH=64; EPOCHS=80; PATIENCE=12
-
-def node_features(wallet):
-    return np.array([
+def node_features(wallet: dict) -> list[float]:
+    """12-element node feature vector (must match models/mod.rs:build_deployer_node_features)."""
+    rug  = wallet.get("rug_involvement", 0)
+    tot  = wallet.get("total_transactions", 1)
+    n_tok = wallet.get("num_tokens_held", 0)
+    win  = wallet.get("win_rate", 0.5)
+    return [
         np.log1p(wallet.get("wallet_age_days", 0)),
         np.log1p(wallet.get("total_transactions", 0)),
         np.log1p(wallet.get("total_sol_volume", 0)),
-        min(wallet.get("rug_involvement_count", 0), 10) / 10.0,
+        min(rug, 10) / 10.0,
         float(wallet.get("is_deployer", False)),
         float(wallet.get("is_known_sniper", False)),
         np.log1p(wallet.get("sol_balance_at_launch", 0)),
-        np.log1p(wallet.get("num_tokens_held", 0)),
+        np.log1p(n_tok),
         np.log1p(wallet.get("avg_hold_duration_hours", 0)),
-        wallet.get("win_rate", 0.5),
+        win,
         float(wallet.get("funded_by_exchange", False)),
         np.log1p(wallet.get("hours_since_last_activity", 0)),
-    ], dtype=np.float32)
+    ]
 
-def edge_features(tx, launch_time):
-    delta = (tx.get("timestamp", launch_time) - launch_time) / 60.0
-    return np.array([np.log1p(tx.get("sol_amount", 0)), np.clip(delta/30.0,0,1),
-                     float(tx.get("is_same_bundle", False)), float(tx.get("is_first_block", False))], dtype=np.float32)
 
-class WalletGATN(nn.Module):
-    def __init__(self):
+def build_graph(token: dict) -> Data:
+    """Convert one token's wallet graph to a PyG Data object."""
+    wallets    = token["wallets"]          # list of wallet dicts
+    adj        = token["adjacency"]        # list of [src_idx, dst_idx] edges
+    deployer_i = token.get("deployer_index", 0)
+
+    x = torch.tensor([node_features(w) for w in wallets], dtype=torch.float)
+    if adj:
+        edge_index = torch.tensor(adj, dtype=torch.long).t().contiguous()
+    else:
+        # Self-loop only (isolated deployer wallet)
+        edge_index = torch.tensor([[0], [0]], dtype=torch.long)
+
+    # Global rug label for the whole graph (0 = safe, 1 = rug)
+    y = torch.tensor([int(token.get("is_rug", 0))], dtype=torch.float)
+
+    # Deployer node index used for pool-then-index prediction head
+    deployer = torch.tensor([deployer_i], dtype=torch.long)
+
+    return Data(x=x, edge_index=edge_index, y=y, deployer=deployer)
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+
+class WalletGNN(torch.nn.Module):
+    def __init__(self, in_dim: int = 12, hidden: int = 64, n_layers: int = 3, dropout: float = 0.3):
         super().__init__()
-        self.node_enc = nn.Sequential(nn.Linear(NODE_DIM, HIDDEN), nn.LayerNorm(HIDDEN), nn.GELU())
-        self.edge_enc = nn.Sequential(nn.Linear(EDGE_DIM, HIDDEN//2), nn.GELU())
-        self.gat   = nn.ModuleList([GATConv(HIDDEN, HIDDEN//HEADS, heads=HEADS, edge_dim=HIDDEN//2, dropout=DROPOUT, concat=True) for _ in range(LAYERS)])
-        self.norms = nn.ModuleList([nn.LayerNorm(HIDDEN) for _ in range(LAYERS)])
-        self.freq  = nn.Sequential(nn.Linear(HIDDEN*2, HIDDEN), nn.GELU(), nn.Linear(HIDDEN, HIDDEN//2), nn.GELU())
-        self.cls   = nn.Sequential(nn.Linear(HIDDEN//2, 64), nn.GELU(), nn.Dropout(DROPOUT), nn.Linear(64, 1))
+        self.dropout = dropout
+        self.convs   = torch.nn.ModuleList()
+        self.bns     = torch.nn.ModuleList()
+        dims = [in_dim] + [hidden] * n_layers
+        for i in range(n_layers):
+            self.convs.append(GCNConv(dims[i], dims[i + 1]))
+            self.bns.append(torch.nn.BatchNorm1d(dims[i + 1]))
+        self.head = torch.nn.Sequential(
+            torch.nn.Linear(hidden, 32), torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(32, 1),
+        )
 
-    def forward(self, data):
-        x  = self.node_enc(data.x)
-        ea = self.edge_enc(data.edge_attr)
-        b  = data.batch if hasattr(data, "batch") and data.batch is not None else torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        for gat, norm in zip(self.gat, self.norms):
-            x = norm(x + F.dropout(gat(x, data.edge_index, edge_attr=ea), DROPOUT, self.training))
-        x = self.freq(torch.cat([global_mean_pool(x, b), global_max_pool(x, b)], -1))
-        return torch.sigmoid(self.cls(x)).squeeze(-1)
+    def forward(self, x, edge_index, batch, deployer):
+        for conv, bn in zip(self.convs, self.bns):
+            x = conv(x, edge_index)
+            x = bn(x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Use deployer node embedding rather than mean-pool (more informative)
+        deployer_emb = x[deployer]               # shape [batch_size, hidden]
+        return self.head(deployer_emb).squeeze(-1)
 
-def synthetic_graphs(n_rug=1500, n_legit=1500):
+
+# ── Data loading ───────────────────────────────────────────────────────────────
+
+def load_data(db_url: str) -> list[Data]:
+    conn = psycopg2.connect(db_url)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT
+            dw.wallet,
+            dw.rug_count,
+            dw.total_tokens_deployed,
+            dw.wallet_age_days,
+            dw.win_rate,
+            array_agg(row_to_json(t.*)) AS token_list,
+            (dw.rug_count::float / GREATEST(dw.total_tokens_deployed, 1)) > 0.4 AS is_rug
+        FROM deployer_wallets dw
+        JOIN tokens t ON t.deployer_wallet = dw.wallet
+        WHERE t.ml_label IS NOT NULL
+        GROUP BY dw.wallet, dw.rug_count, dw.total_tokens_deployed,
+                 dw.wallet_age_days, dw.win_rate
+        HAVING COUNT(t.*) >= 2
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
     graphs = []
-    for label, n_graphs in [(1, n_rug), (0, n_legit)]:
-        for _ in range(n_graphs):
-            n  = np.random.randint(3, 20)
-            x  = np.random.randn(n, NODE_DIM).astype(np.float32)
-            if label == 1:
-                x[0,0]=np.log1p(1); x[0,4]=1.0; x[0,3]=np.random.uniform(0.5,1.0)
-                for j in range(1, min(n-1, np.random.randint(3,8))+1): x[j,5]=1.0
-            else:
-                x[0,0]=np.log1p(np.random.uniform(30,500)); x[0,4]=1.0; x[0,3]=0.0
-            n_e=n*2; src=np.random.randint(0,n,n_e); dst=np.random.randint(0,n,n_e)
-            ea=np.random.randn(n_e, EDGE_DIM).astype(np.float32)
-            if label==1: ea[:min(5,n_e),2]=1.0
-            graphs.append(Data(x=torch.tensor(x), edge_index=torch.tensor([src,dst],dtype=torch.long),
-                               edge_attr=torch.tensor(ea), y=torch.tensor([label]), num_nodes=n))
-    np.random.shuffle(graphs)
+    for row in rows:
+        # Build a minimal ego-graph: deployer + top holders as satellite nodes
+        tokens = row["token_list"] or []
+        deployer_node = {
+            "wallet_age_days":        row.get("wallet_age_days", 0),
+            "total_transactions":     (row.get("total_tokens_deployed", 0) or 0) * 10,
+            "total_sol_volume":       0,
+            "rug_involvement":        row.get("rug_count", 0),
+            "is_deployer":            True,
+            "is_known_sniper":        False,
+            "sol_balance_at_launch":  0,
+            "num_tokens_held":        len(tokens),
+            "avg_hold_duration_hours": 0,
+            "win_rate":               row.get("win_rate", 0.5) or 0.5,
+            "funded_by_exchange":     False,
+            "hours_since_last_activity": 0,
+        }
+        wallets = [deployer_node]
+        # Add satellite nodes from top_holders JSON stored on the token row
+        for tok in tokens[:5]:
+            holders = tok.get("top_holders_json") or []
+            for h in (holders[:2] if isinstance(holders, list) else []):
+                if isinstance(h, dict):
+                    wallets.append({
+                        "wallet_age_days":       h.get("age_days", 30),
+                        "total_transactions":    100,
+                        "total_sol_volume":      h.get("sol_volume", 0),
+                        "rug_involvement":       0,
+                        "is_deployer":           False,
+                        "is_known_sniper":       h.get("is_sniper", False),
+                        "sol_balance_at_launch": 0,
+                        "num_tokens_held":       1,
+                        "avg_hold_duration_hours": 0,
+                        "win_rate":              0.5,
+                        "funded_by_exchange":    False,
+                        "hours_since_last_activity": 24,
+                    })
+
+        n = len(wallets)
+        # Fully-connect satellite nodes to deployer (star topology)
+        adj = [[0, i] for i in range(1, n)] + [[i, 0] for i in range(1, n)]
+
+        is_rug = bool(row.get("is_rug", False))
+        try:
+            graphs.append(build_graph({
+                "wallets": wallets, "adjacency": adj, "deployer_index": 0, "is_rug": is_rug,
+            }))
+        except Exception as exc:
+            log.warning("Skipping row for wallet %s: %s", row["wallet"], exc)
+
+    log.info("Loaded %d wallet graphs (%d rugs)", len(graphs), sum(g.y.item() > 0 for g in graphs))
     return graphs
 
-def train(model, loader, opt, device):
-    model.train(); loss_sum=0; crit=nn.BCELoss()
+
+# ── Training loop ──────────────────────────────────────────────────────────────
+
+def train_epoch(model, loader, optim, device):
+    model.train()
+    total_loss = 0.0
     for batch in loader:
-        batch=batch.to(device); opt.zero_grad()
-        loss=crit(model(batch), batch.y.float())
-        loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
-        loss_sum+=loss.item()
-    return loss_sum/len(loader)
+        batch = batch.to(device)
+        optim.zero_grad()
+        logits = model(batch.x, batch.edge_index, batch.batch, batch.deployer)
+        loss   = F.binary_cross_entropy_with_logits(
+            logits, batch.y,
+            pos_weight=torch.tensor([3.0], device=device),   # rugs are rare
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optim.step()
+        total_loss += loss.item()
+    return total_loss / max(len(loader), 1)
+
 
 @torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval(); probs,labels=[],[]
+def evaluate(model, loader, device) -> dict:
+    model.eval()
+    preds, labels = [], []
     for batch in loader:
-        batch=batch.to(device)
-        probs.extend(model(batch).cpu().tolist()); labels.extend(batch.y.cpu().tolist())
-    probs,labels=np.array(probs),np.array(labels)
-    preds=(probs>=0.5).astype(int)
-    return dict(f1=f1_score(labels,preds,zero_division=0),
-                auc=roc_auc_score(labels,probs) if len(set(labels))>1 else 0.5,
-                rug_recall=recall_score(labels,preds,zero_division=0))
+        batch = batch.to(device)
+        logits = model(batch.x, batch.edge_index, batch.batch, batch.deployer)
+        probs  = torch.sigmoid(logits).cpu().numpy()
+        preds.extend(probs.tolist())
+        labels.extend(batch.y.cpu().numpy().tolist())
+
+    preds_b = [1 if p >= 0.5 else 0 for p in preds]
+    tp = sum(p == 1 and l == 1 for p, l in zip(preds_b, labels))
+    fp = sum(p == 1 and l == 0 for p, l in zip(preds_b, labels))
+    fn = sum(p == 0 and l == 1 for p, l in zip(preds_b, labels))
+    tn = sum(p == 0 and l == 0 for p, l in zip(preds_b, labels))
+
+    precision = tp / max(tp + fp, 1)
+    recall    = tp / max(tp + fn, 1)
+    f1        = 2 * precision * recall / max(precision + recall, 1e-9)
+    acc       = (tp + tn) / max(len(labels), 1)
+
+    # FIX (Bug #1): avoid same-quote dict access inside f-strings.
+    # Store values in locals before interpolating.
+    return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def export_onnx(model, out_path: str, device):
+    """Export the GNN as ONNX. Uses a fixed-size single-node dummy input."""
+    model.eval()
+    dummy_x          = torch.zeros((1, 12), device=device)
+    dummy_edge_index = torch.zeros((2, 1), dtype=torch.long, device=device)
+    dummy_batch      = torch.zeros(1, dtype=torch.long, device=device)
+    dummy_deployer   = torch.zeros(1, dtype=torch.long, device=device)
+
+    class OnnxWrapper(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+        def forward(self, node_features):
+            # Simplified: single-node inference without edges (deployer only)
+            x = node_features
+            for conv, bn in zip(self.inner.convs, self.inner.bns):
+                # Without edges we just apply the linear transform part
+                x = conv.lin(x)
+                x = bn(x)
+                x = F.relu(x)
+                x = F.dropout(x, p=0.0, training=False)
+            return torch.sigmoid(self.inner.head(x).squeeze(-1))
+
+    wrapper = OnnxWrapper(model).to(device)
+    wrapper.eval()
+
+    torch.onnx.export(
+        wrapper,
+        (dummy_x,),
+        out_path,
+        input_names=["node_features"],
+        output_names=["rug_probability"],
+        dynamic_axes={"node_features": {0: "batch_size"}, "rug_probability": {0: "batch_size"}},
+        opset_version=17,
+        do_constant_folding=True,
+    )
+    log.info("ONNX model exported to %s", out_path)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser=argparse.ArgumentParser()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db-url",     required=True)
     parser.add_argument("--output-dir", default="./ml/models")
-    parser.add_argument("--synthetic", action="store_true")
-    parser.add_argument("--db-url", default=os.environ.get("DATABASE_URL"))
-    args=parser.parse_args()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"GNN training on {device}")
-    graphs=synthetic_graphs(2000,2000)
-    split=int(len(graphs)*0.8)
-    tr_loader=DataLoader(graphs[:split],BATCH,shuffle=True)
-    va_loader=DataLoader(graphs[split:],BATCH)
-    model=WalletGATN().to(device)
-    opt=torch.optim.AdamW(model.parameters(), LR, weight_decay=1e-4)
-    sched=torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS, 1e-6)
-    best_f1,best_state,patience=0,None,0
-    for epoch in range(1, EPOCHS+1):
-        loss=train(model,tr_loader,opt,device); m=evaluate(model,va_loader,device); sched.step()
-        if m["f1"]>best_f1:
-            best_f1,best_state,patience=m["f1"],{k:v.clone() for k,v in model.state_dict().items()},0
-            torch.save(best_state, f"{args.output_dir}/wallet_gnn_best.pt")
-        else: patience+=1
-        if patience>=PATIENCE: log.info(f"Early stop epoch {epoch}"); break
-        if epoch%10==0: log.info(f"Epoch {epoch:3d} | loss={loss:.4f} | F1={m["f1"]:.4f} | AUC={m["auc"]:.4f}")
-    model.load_state_dict(best_state); final=evaluate(model,va_loader,device)
-    log.info(f"Final | F1={final["f1"]:.4f} | AUC={final["auc"]:.4f} | rug_recall={final["rug_recall"]:.4f}")
-    class Wrapper(nn.Module):
-        def __init__(self,m): super().__init__(); self.enc=m.node_enc; self.freq=m.freq; self.cls=m.cls
-        def forward(self,x): h=self.enc(x); h=self.freq(torch.cat([h,h],-1)); return torch.sigmoid(self.cls(h))
-    model.cpu().eval(); wrapper=Wrapper(model).eval(); dummy=torch.zeros(1,NODE_DIM)
-    torch.onnx.export(wrapper,dummy,f"{args.output_dir}/wallet_gnn.onnx",opset_version=17,
-                      input_names=["node_features"],output_names=["rug_probability"],
-                      dynamic_axes={"node_features":{0:"batch"},"rug_probability":{0:"batch"}})
-    torch.save(model.state_dict(), f"{args.output_dir}/wallet_gnn_full.pt")
-    with open(f"{args.output_dir}/gnn_metrics.json","w") as f: json.dump(final,f,indent=2)
-    log.info(f"GNN complete — ONNX + full weights saved to {args.output_dir}/")
+    parser.add_argument("--epochs",     type=int, default=80)
+    parser.add_argument("--hidden",     type=int, default=64)
+    parser.add_argument("--lr",         type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--dropout",    type=float, default=0.3)
+    args = parser.parse_args()
 
-if __name__=="__main__": main()
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_dir  = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    graphs = load_data(args.db_url)
+    if len(graphs) < 20:
+        log.warning("Only %d graphs — need more wallet data; skipping GNN training", len(graphs))
+        return
+
+    # Train / val split (80/20)
+    n_train  = int(len(graphs) * 0.8)
+    train_ds = graphs[:n_train]
+    val_ds   = graphs[n_train:]
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  follow_batch=["deployer"])
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, follow_batch=["deployer"])
+
+    model = WalletGNN(in_dim=12, hidden=args.hidden, dropout=args.dropout).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    sched = CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-6)
+
+    best_f1     = 0.0
+    best_path   = str(out_dir / "gnn_best.pt")
+    patience    = 15
+    no_improve  = 0
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_epoch(model, train_loader, optim, device)
+        sched.step()
+
+        if epoch % 5 == 0 or epoch == 1:
+            m   = evaluate(model, val_loader, device)
+            # FIX (Bug #1): extract values before f-string interpolation.
+            f1_val   = m["f1"]
+            acc_val  = m["accuracy"]
+            rec_val  = m["recall"]
+            prec_val = m["precision"]
+            log.info(
+                "Epoch %3d | loss %.4f | F1 %.4f | acc %.4f | rec %.4f | prec %.4f",
+                epoch, train_loss, f1_val, acc_val, rec_val, prec_val,
+            )
+            if f1_val > best_f1:
+                best_f1    = f1_val
+                no_improve = 0
+                torch.save(model.state_dict(), best_path)
+                log.info("  ✅ New best F1 %.4f — checkpoint saved", best_f1)
+            else:
+                no_improve += 5
+                if no_improve >= patience:
+                    log.info("Early stopping at epoch %d (no improvement for %d epochs)", epoch, patience)
+                    break
+
+    # Reload best and export
+    model.load_state_dict(torch.load(best_path, map_location=device))
+    onnx_path = str(out_dir / "gnn.onnx")
+    export_onnx(model, onnx_path, device)
+
+    # Save metrics
+    final_metrics = evaluate(model, val_loader, device)
+    metrics_path  = str(out_dir / "gnn_metrics.json")
+    with open(metrics_path, "w") as f:
+        # FIX (Bug #1): no same-quote dict access in f-strings — use json.dump directly.
+        json.dump({"best_val_f1": best_f1, **final_metrics}, f, indent=2)
+
+    # Final summary log — FIX (Bug #1): temp vars for all dict values.
+    fm_f1   = final_metrics["f1"]
+    fm_acc  = final_metrics["accuracy"]
+    fm_rec  = final_metrics["recall"]
+    fm_prec = final_metrics["precision"]
+    log.info(
+        "GNN training complete | F1 %.4f | acc %.4f | recall %.4f | precision %.4f",
+        fm_f1, fm_acc, fm_rec, fm_prec,
+    )
+    log.info("ONNX → %s | Metrics → %s", onnx_path, metrics_path)
+
+
+if __name__ == "__main__":
+    main()

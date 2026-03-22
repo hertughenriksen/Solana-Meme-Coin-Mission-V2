@@ -17,12 +17,12 @@ use rpc_client::SolanaRpcClient;
 use swap_builder::*;
 
 pub struct ExecutionEngine {
-    config: Arc<BotConfig>,
-    db: Arc<Database>,
-    redis: Arc<RedisClient>,
-    rpc: Arc<SolanaRpcClient>,
+    config:  Arc<BotConfig>,
+    db:      Arc<Database>,
+    redis:   Arc<RedisClient>,
+    rpc:     Arc<SolanaRpcClient>,
     keypair: solana_sdk::signature::Keypair,
-    http: reqwest::Client,
+    http:    reqwest::Client,
 }
 
 impl ExecutionEngine {
@@ -45,7 +45,6 @@ impl ExecutionEngine {
 
         let pubkey = keypair.pubkey().to_string();
         info!("⚡ Execution engine ready | wallet: {}…{}", &pubkey[..4], &pubkey[pubkey.len() - 4..]);
-
         Ok(Self { config, db, redis, rpc, keypair, http })
     }
 
@@ -63,7 +62,7 @@ impl ExecutionEngine {
     }
 
     async fn execute_buy(&self, decision: TradeDecision) -> Result<()> {
-        let mint = &decision.signal.mint;
+        let mint       = &decision.signal.mint;
         let mint_short = &mint[..mint.len().min(8)];
 
         if self.config.bot.dry_run {
@@ -83,32 +82,28 @@ impl ExecutionEngine {
             }
         }
 
-        let on_chain = decision.signal.on_chain.as_ref().context("No on-chain data in signal")?;
+        let on_chain     = decision.signal.on_chain.as_ref().context("No on-chain data in signal")?;
         let sol_lamports = (decision.buy_amount_sol * 1e9) as u64;
         let slippage_bps = decision.max_slippage_bps;
-
-        let swap_ix = self.build_buy_instruction(mint, on_chain, sol_lamports, slippage_bps).await?;
+        let swap_ix      = self.build_buy_instruction(mint, on_chain, sol_lamports, slippage_bps).await?;
 
         let mut all_ixs = Vec::new();
         if matches!(on_chain.dex, DexType::RaydiumCPMM | DexType::RaydiumAMM) {
-            let mut wrap_ixs = wrap_sol_instructions(&self.keypair.pubkey(), sol_lamports)?;
-            all_ixs.append(&mut wrap_ixs);
+            all_ixs.append(&mut wrap_sol_instructions(&self.keypair.pubkey(), sol_lamports)?);
         }
         all_ixs.push(swap_ix);
         if matches!(on_chain.dex, DexType::RaydiumCPMM | DexType::RaydiumAMM) {
             all_ixs.push(unwrap_wsol_instruction(&self.keypair.pubkey())?);
         }
 
-        let cu_price = self.micro_lamports_per_cu().await;
-        let compute_ixs = vec![set_compute_unit_limit(300_000), set_compute_unit_price(cu_price)];
-        let final_ixs = [compute_ixs, all_ixs].concat();
+        let cu_price  = self.micro_lamports_per_cu().await;
+        let final_ixs = [vec![set_compute_unit_limit(300_000), set_compute_unit_price(cu_price)], all_ixs].concat();
 
         let tip_lamports = self.calculate_tip(decision.buy_amount_sol).await;
         let blockhash    = self.rpc.get_latest_blockhash().await?;
         let bundle       = self.build_jito_bundle(final_ixs, tip_lamports, blockhash).await?;
 
-        info!("🚀 BUY {} | {:.4} SOL | tip {} lamports | via {} engines",
-            mint_short, decision.buy_amount_sol, tip_lamports, self.config.jito.block_engines.len());
+        info!("🚀 BUY {} | {:.4} SOL | tip {} lamports", mint_short, decision.buy_amount_sol, tip_lamports);
 
         let results      = self.submit_bundle_parallel(&bundle).await;
         let any_accepted = results.iter().any(|r| r.is_ok());
@@ -145,18 +140,52 @@ impl ExecutionEngine {
         self.db.insert_trade(&trade).await?;
         self.redis.set_open_position(mint, &trade).await?;
 
-        let db = self.db.clone();
-        let trade_id = trade.id;
+        // FIX (Bug #4): Poll the actual Jito bundle status instead of
+        // unconditionally marking Confirmed after 5 s.  A failed or stuck
+        // bundle now correctly ends up as Failed, which keeps the circuit
+        // breaker loss counter and P&L accurate.
+        let bundle_id = results.iter().filter_map(|r| r.as_ref().ok()).next().cloned().unwrap_or_default();
+        let engine    = self.config.jito.block_engines.first().cloned().unwrap_or_default();
+        let db_clone  = self.db.clone();
+        let redis_clone = self.redis.clone();
+        let trade_id  = trade.id;
+        let mint_for_task = mint.clone();
+        let http_clone = self.http.clone();
+
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let _ = db.update_trade_status(trade_id, TradeStatus::Confirmed).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    // Timeout — treat as failed to avoid phantom open positions.
+                    warn!("Bundle confirmation timeout for trade {} — marking failed", trade_id);
+                    let _ = db_clone.update_trade_failed(trade_id).await;
+                    let _ = redis_clone.remove_open_position(&mint_for_task).await;
+                    return;
+                }
+                match poll_bundle_status(&http_clone, &engine, &bundle_id).await {
+                    Ok(status) if status == "landed" => {
+                        info!("✅ Bundle landed for trade {}", trade_id);
+                        let _ = db_clone.update_trade_status(trade_id, TradeStatus::Confirmed).await;
+                        return;
+                    }
+                    Ok(status) if status == "failed" || status == "invalid" => {
+                        warn!("Bundle {} — marking trade {} as failed", status, trade_id);
+                        let _ = db_clone.update_trade_failed(trade_id).await;
+                        let _ = redis_clone.remove_open_position(&mint_for_task).await;
+                        return;
+                    }
+                    Ok(_)  => {} // still pending — keep polling
+                    Err(e) => { debug!("Bundle status poll error: {}", e); }
+                }
+            }
         });
 
         Ok(())
     }
 
     async fn execute_sell(&self, decision: TradeDecision, sell_pct: f64) -> Result<()> {
-        let mint = &decision.signal.mint;
+        let mint       = &decision.signal.mint;
         let mint_short = &mint[..mint.len().min(8)];
 
         if self.config.bot.dry_run {
@@ -186,7 +215,11 @@ impl ExecutionEngine {
 
         if results.iter().any(|r| r.is_ok()) {
             info!("🔴 SELL {:.0}% of {} submitted", sell_pct * 100.0, mint_short);
-            if sell_pct >= 1.0 { self.redis.remove_open_position(mint).await?; }
+            // Position is removed here (after sell confirmed) — NOT in fire_full_exit.
+            // See Bug #5 fix in strategy/mod.rs.
+            if sell_pct >= 1.0 {
+                self.redis.remove_open_position(mint).await?;
+            }
         } else {
             error!("Sell bundle failed for {} — will retry next position-manager tick", mint_short);
         }
@@ -196,17 +229,14 @@ impl ExecutionEngine {
     async fn build_buy_instruction(&self, mint: &str, on_chain: &OnChainData, sol_lamports: u64, slippage_bps: u32) -> Result<solana_sdk::instruction::Instruction> {
         use std::str::FromStr;
         use solana_sdk::pubkey::Pubkey;
-
         let mint_pubkey = Pubkey::from_str(mint)?;
         let user = self.keypair.pubkey();
-
         match on_chain.dex {
             DexType::PumpFun | DexType::PumpSwap => {
                 let (bonding_curve, _) = derive_pump_fun_bonding_curve(&mint_pubkey);
                 let bc_ata = spl_associated_token_account::get_associated_token_address(&bonding_curve, &mint_pubkey);
-                let price_usd     = on_chain.price_usd.max(1e-10);
-                let sol_price_usd = self.get_sol_price_usd().await;
-                build_pump_fun_buy(&mint_pubkey, &bonding_curve, &bc_ata, &user, sol_lamports, slippage_bps, price_usd, sol_price_usd)
+                build_pump_fun_buy(&mint_pubkey, &bonding_curve, &bc_ata, &user, sol_lamports, slippage_bps,
+                    on_chain.price_usd.max(1e-10), self.get_sol_price_usd().await)
             }
             DexType::RaydiumCPMM => {
                 let pool_state = Pubkey::from_str(&on_chain.pool_address).unwrap_or_default();
@@ -215,8 +245,7 @@ impl ExecutionEngine {
                 let pool = CpmmPoolAccounts {
                     pool_id: pool_state, pool_authority: Pubkey::from_str(RAYDIUM_CPMM_AUTHORITY)?,
                     pool_state, token0_mint: wsol_mint, token1_mint: mint_pubkey,
-                    token0_vault, token1_vault, lp_mint: Pubkey::default(),
-                    observation_key: Pubkey::default(),
+                    token0_vault, token1_vault, lp_mint: Pubkey::default(), observation_key: Pubkey::default(),
                 };
                 let min_out = apply_slippage(self.estimate_token_out(sol_lamports, on_chain), slippage_bps);
                 build_raydium_cpmm_swap(&pool, &user, sol_lamports, min_out, true)
@@ -233,17 +262,14 @@ impl ExecutionEngine {
     async fn build_sell_instruction(&self, mint: &str, on_chain: &OnChainData, token_amount: u64, slippage_bps: u32) -> Result<solana_sdk::instruction::Instruction> {
         use std::str::FromStr;
         use solana_sdk::pubkey::Pubkey;
-
         let mint_pubkey = Pubkey::from_str(mint)?;
         let user = self.keypair.pubkey();
-
         match on_chain.dex {
             DexType::PumpFun | DexType::PumpSwap => {
                 let (bonding_curve, _) = derive_pump_fun_bonding_curve(&mint_pubkey);
                 let bc_ata = spl_associated_token_account::get_associated_token_address(&bonding_curve, &mint_pubkey);
-                let price_usd     = on_chain.price_usd.max(1e-10);
-                let sol_price_usd = self.get_sol_price_usd().await;
-                build_pump_fun_sell(&mint_pubkey, &bonding_curve, &bc_ata, &user, token_amount, slippage_bps, price_usd, sol_price_usd)
+                build_pump_fun_sell(&mint_pubkey, &bonding_curve, &bc_ata, &user, token_amount, slippage_bps,
+                    on_chain.price_usd.max(1e-10), self.get_sol_price_usd().await)
             }
             DexType::RaydiumCPMM => {
                 let pool_state = Pubkey::from_str(&on_chain.pool_address).unwrap_or_default();
@@ -252,11 +278,9 @@ impl ExecutionEngine {
                 let pool = CpmmPoolAccounts {
                     pool_id: pool_state, pool_authority: Pubkey::from_str(RAYDIUM_CPMM_AUTHORITY)?,
                     pool_state, token0_mint: wsol_mint, token1_mint: mint_pubkey,
-                    token0_vault, token1_vault, lp_mint: Pubkey::default(),
-                    observation_key: Pubkey::default(),
+                    token0_vault, token1_vault, lp_mint: Pubkey::default(), observation_key: Pubkey::default(),
                 };
-                let sol_estimate = self.estimate_sol_out(token_amount, on_chain);
-                let min_sol_out  = apply_slippage(sol_estimate, slippage_bps);
+                let min_sol_out = apply_slippage(self.estimate_sol_out(token_amount, on_chain), slippage_bps);
                 build_raydium_cpmm_swap(&pool, &user, token_amount, min_sol_out, false)
             }
             _ => self.build_jupiter_swap_ix(mint, token_amount, slippage_bps, false).await,
@@ -265,14 +289,12 @@ impl ExecutionEngine {
 
     async fn build_jupiter_swap_ix(&self, mint: &str, amount: u64, slippage_bps: u32, is_buy: bool) -> Result<solana_sdk::instruction::Instruction> {
         use std::str::FromStr;
-
         let (input_mint, output_mint) = if is_buy { (WSOL_MINT, mint) } else { (mint, WSOL_MINT) };
         let quote_url = format!(
             "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
             input_mint, output_mint, amount, slippage_bps,
         );
         let quote: serde_json::Value = self.http.get(&quote_url).send().await?.json().await?;
-
         let swap_body = serde_json::json!({
             "quoteResponse": quote,
             "userPublicKey": self.keypair.pubkey().to_string(),
@@ -283,15 +305,12 @@ impl ExecutionEngine {
         let swap_resp: serde_json::Value = self.http
             .post("https://quote-api.jup.ag/v6/swap-instructions")
             .json(&swap_body).send().await?.json().await?;
-
         let tx_b64   = swap_resp["swapTransaction"].as_str().context("No swapTransaction in Jupiter response")?;
         let tx_bytes = base64::engine::general_purpose::STANDARD.decode(tx_b64)?;
         let tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&tx_bytes)?;
-
         let message      = tx.message;
         let account_keys: Vec<solana_sdk::pubkey::Pubkey> = message.static_account_keys().to_vec();
         let compute_prog = solana_sdk::pubkey::Pubkey::from_str(COMPUTE_BUDGET_PROGRAM_ID)?;
-
         for ix in message.instructions() {
             let prog = account_keys.get(ix.program_id_index as usize).copied().unwrap_or_default();
             if prog != compute_prog {
@@ -300,13 +319,8 @@ impl ExecutionEngine {
                         pubkey: account_keys[idx as usize],
                         is_signer: false,
                         is_writable: true,
-                    })
-                    .collect();
-                return Ok(solana_sdk::instruction::Instruction {
-                    program_id: prog,
-                    accounts,
-                    data: ix.data.clone(),
-                });
+                    }).collect();
+                return Ok(solana_sdk::instruction::Instruction { program_id: prog, accounts, data: ix.data.clone() });
             }
         }
         anyhow::bail!("Could not extract swap instruction from Jupiter transaction")
@@ -339,7 +353,7 @@ impl ExecutionEngine {
                 if let Some(result) = resp.get("result") {
                     Ok(result.as_str().unwrap_or("").to_string())
                 } else {
-                    Err(anyhow::anyhow!("Jito: {}", resp.get("error").unwrap_or(&serde_json::Value::Null)))
+                    Err(anyhow::anyhow!("Jito error: {}", resp.get("error").unwrap_or(&serde_json::Value::Null)))
                 }
             }
         }).collect();
@@ -405,8 +419,7 @@ impl ExecutionEngine {
         let positions = self.redis.get_all_open_positions().await?;
         if let Some(pos) = positions.iter().find(|p| p.mint == mint) {
             if pos.entry_price_usd > 0.0 {
-                let drop_fraction = 1.0 - (current / pos.entry_price_usd);
-                return Ok(drop_fraction >= threshold);
+                return Ok(1.0 - (current / pos.entry_price_usd) >= threshold);
             }
         }
         Ok(false)
@@ -443,12 +456,8 @@ impl ExecutionEngine {
         let pool_pk   = solana_sdk::pubkey::Pubkey::from_str(pool_address)?;
         let wsol_mint = solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?;
         let cpmm      = solana_sdk::pubkey::Pubkey::from_str(RAYDIUM_CPMM_PROGRAM_ID)?;
-        let (v0, _)   = solana_sdk::pubkey::Pubkey::find_program_address(
-            &[b"pool_vault", pool_pk.as_ref(), wsol_mint.as_ref()], &cpmm,
-        );
-        let (v1, _)   = solana_sdk::pubkey::Pubkey::find_program_address(
-            &[b"pool_vault", pool_pk.as_ref(), pool_pk.as_ref()], &cpmm,
-        );
+        let (v0, _)   = solana_sdk::pubkey::Pubkey::find_program_address(&[b"pool_vault", pool_pk.as_ref(), wsol_mint.as_ref()], &cpmm);
+        let (v1, _)   = solana_sdk::pubkey::Pubkey::find_program_address(&[b"pool_vault", pool_pk.as_ref(), pool_pk.as_ref()], &cpmm);
         Ok((v0, v1))
     }
 
@@ -459,34 +468,66 @@ impl ExecutionEngine {
             if let Some(data_b64) = account["data"][0].as_str() {
                 let data = base64::engine::general_purpose::STANDARD.decode(data_b64)?;
                 if data.len() >= 288 {
-                    let parse_pk = |slice: &[u8]| {
-                        solana_sdk::pubkey::Pubkey::from(<[u8; 32]>::try_from(slice).unwrap_or([0u8; 32]))
-                    };
+                    let parse_pk = |slice: &[u8]| solana_sdk::pubkey::Pubkey::from(<[u8; 32]>::try_from(slice).unwrap_or([0u8; 32]));
                     let amm_pk   = solana_sdk::pubkey::Pubkey::from_str(pool_address)?;
                     let amm_prog = solana_sdk::pubkey::Pubkey::from_str(RAYDIUM_AMM_PROGRAM_ID)?;
-                    let (authority, _) = solana_sdk::pubkey::Pubkey::find_program_address(
-                        &[b"amm authority"], &amm_prog,
-                    );
+                    let (authority, _) = solana_sdk::pubkey::Pubkey::find_program_address(&[b"amm authority"], &amm_prog);
                     return Ok(AmmV4PoolAccounts {
                         amm_id: amm_pk, amm_authority: authority,
-                        amm_open_orders:        parse_pk(&data[32..64]),
-                        amm_target_orders:      parse_pk(&data[64..96]),
+                        amm_open_orders:         parse_pk(&data[32..64]),
+                        amm_target_orders:       parse_pk(&data[64..96]),
                         pool_coin_token_account: parse_pk(&data[96..128]),
-                        pool_pc_token_account:  parse_pk(&data[128..160]),
-                        serum_program_id:       parse_pk(&data[256..288]),
-                        serum_market:           parse_pk(&data[224..256]),
-                        serum_bids:         solana_sdk::pubkey::Pubkey::default(),
-                        serum_asks:         solana_sdk::pubkey::Pubkey::default(),
-                        serum_event_queue:  solana_sdk::pubkey::Pubkey::default(),
-                        serum_coin_vault:   solana_sdk::pubkey::Pubkey::default(),
-                        serum_pc_vault:     solana_sdk::pubkey::Pubkey::default(),
-                        serum_vault_signer: solana_sdk::pubkey::Pubkey::default(),
-                        base_mint:          solana_sdk::pubkey::Pubkey::default(),
-                        quote_mint:         solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?,
+                        pool_pc_token_account:   parse_pk(&data[128..160]),
+                        serum_program_id:        parse_pk(&data[256..288]),
+                        serum_market:            parse_pk(&data[224..256]),
+                        serum_bids:              solana_sdk::pubkey::Pubkey::default(),
+                        serum_asks:              solana_sdk::pubkey::Pubkey::default(),
+                        serum_event_queue:       solana_sdk::pubkey::Pubkey::default(),
+                        serum_coin_vault:        solana_sdk::pubkey::Pubkey::default(),
+                        serum_pc_vault:          solana_sdk::pubkey::Pubkey::default(),
+                        serum_vault_signer:      solana_sdk::pubkey::Pubkey::default(),
+                        base_mint:               solana_sdk::pubkey::Pubkey::default(),
+                        quote_mint:              solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?,
                     });
                 }
             }
         }
         anyhow::bail!("Cannot decode Raydium AMM pool state for {}", pool_address)
+    }
+}
+
+// ── Jito bundle status polling ────────────────────────────────────────────────
+//
+// FIX (Bug #4): polls getBundleStatuses on the Jito block-engine so we know
+// whether a bundle actually landed before updating the trade record.
+
+async fn poll_bundle_status(http: &reqwest::Client, engine_url: &str, bundle_id: &str) -> Result<String> {
+    if bundle_id.is_empty() { return Ok("pending".into()); }
+    // Strip /bundles suffix if present to get the base URL
+    let base = engine_url.trim_end_matches("/api/v1/bundles");
+    let url  = format!("{}/api/v1/bundles", base);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBundleStatuses",
+        "params": [[bundle_id]],
+    });
+    let resp: serde_json::Value = http.post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
+        .send().await?.json().await?;
+
+    let status = resp["result"]["value"][0]["confirmation_status"]
+        .as_str()
+        .or_else(|| resp["result"]["value"][0]["status"].as_str())
+        .unwrap_or("pending");
+
+    // Jito returns: "invalid", "pending", "failed", "landed" / "confirmed"
+    match status {
+        "confirmed" | "finalized" => Ok("landed".into()),
+        "landed"  => Ok("landed".into()),
+        "failed"  => Ok("failed".into()),
+        "invalid" => Ok("invalid".into()),
+        _         => Ok("pending".into()),
     }
 }

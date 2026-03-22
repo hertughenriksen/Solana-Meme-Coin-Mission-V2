@@ -12,10 +12,10 @@ use crate::monitor::record_trade_exited;
 use crate::types::*;
 
 pub struct StrategyEngine {
-    config: Arc<BotConfig>,
-    db: Arc<Database>,
-    redis: Arc<RedisClient>,
-    filter: Arc<FilterPipeline>,
+    config:   Arc<BotConfig>,
+    db:       Arc<Database>,
+    redis:    Arc<RedisClient>,
+    filter:   Arc<FilterPipeline>,
     trade_tx: mpsc::Sender<TradeDecision>,
 }
 
@@ -61,7 +61,6 @@ impl StrategyEngine {
 
         let fr = self.filter.evaluate(&signal).await?;
 
-        // Log every signal to the DB so analytics and copy-wallet attribution work.
         {
             let db       = self.db.clone();
             let sig_log  = signal.clone();
@@ -73,7 +72,8 @@ impl StrategyEngine {
         }
 
         if !fr.passed {
-            debug!("❌ {} rejected: {}", &signal.mint[..signal.mint.len().min(8)], fr.rejection_reason.as_deref().unwrap_or("?"));
+            debug!("❌ {} rejected: {}", &signal.mint[..signal.mint.len().min(8)],
+                   fr.rejection_reason.as_deref().unwrap_or("?"));
             return Ok(());
         }
 
@@ -89,7 +89,8 @@ impl StrategyEngine {
         if decision.decision_type == DecisionType::Skip { return Ok(()); }
 
         info!("📝 Decision: {:?} | {} | {:.4} SOL | ML {:.3}",
-            decision.decision_type, &decision.signal.mint[..decision.signal.mint.len().min(8)],
+            decision.decision_type,
+            &decision.signal.mint[..decision.signal.mint.len().min(8)],
             decision.buy_amount_sol, decision.filter_result.ensemble_score);
 
         let _ = self.trade_tx.send(decision).await;
@@ -116,7 +117,10 @@ impl StrategyEngine {
         let cfg = &self.config.strategy;
         let Some(ref copy) = signal.copy_trade else { return Ok(self.skip(signal, fr)); };
         if copy.source_wallet_winrate < cfg.copy_wallet_min_winrate { return Ok(self.skip(signal, fr)); }
-        let our_buy = (copy.buy_amount_sol * 0.5).min(cfg.copy_max_buy_sol).min(available * 0.25).max(0.01);
+        let our_buy = (copy.buy_amount_sol * 0.5)
+            .min(cfg.copy_max_buy_sol)
+            .min(available * 0.25)
+            .max(0.01);
         Ok(TradeDecision {
             id: Uuid::new_v4(), signal, filter_result: fr,
             decision_type: DecisionType::Buy, strategy_track: StrategyTrack::CopyTrade,
@@ -127,7 +131,9 @@ impl StrategyEngine {
     }
 
     async fn build_sentiment_decision(&self, signal: TokenSignal, fr: FilterResult, available: f64) -> Result<TradeDecision> {
-        let size = (available * 0.05).min(0.15).min(self.config.wallet.max_position_size_sol);
+        let size = (available * 0.05)
+            .min(0.15)
+            .min(self.config.wallet.max_position_size_sol);
         Ok(TradeDecision {
             id: Uuid::new_v4(), signal, filter_result: fr,
             decision_type: DecisionType::Buy, strategy_track: StrategyTrack::Sentiment,
@@ -154,13 +160,15 @@ impl StrategyEngine {
                 .unwrap_or(0);
 
             if mult >= cfg.tp_1_multiplier && !self.redis.has_taken_tp1(&pos.mint).await? {
-                info!("🎯 TP1 {:.2}x on {} — selling {:.0}%", mult, &pos.mint[..pos.mint.len().min(8)], cfg.tp_1_sell_pct * 100.0);
+                info!("🎯 TP1 {:.2}x on {} — selling {:.0}%",
+                      mult, &pos.mint[..pos.mint.len().min(8)], cfg.tp_1_sell_pct * 100.0);
                 self.fire_partial_sell(&pos, cfg.tp_1_sell_pct).await?;
                 self.redis.mark_tp1_taken(&pos.mint).await?;
             }
 
             if mult >= cfg.tp_2_multiplier && !self.redis.has_taken_tp2(&pos.mint).await? {
-                info!("🎯 TP2 {:.2}x on {} — selling {:.0}%, setting trail", mult, &pos.mint[..pos.mint.len().min(8)], cfg.tp_2_sell_pct * 100.0);
+                info!("🎯 TP2 {:.2}x on {} — selling {:.0}%, setting trail",
+                      mult, &pos.mint[..pos.mint.len().min(8)], cfg.tp_2_sell_pct * 100.0);
                 self.fire_partial_sell(&pos, cfg.tp_2_sell_pct).await?;
                 self.redis.mark_tp2_taken(&pos.mint).await?;
                 let trail = price * (1.0 - cfg.tp_3_trailing_stop_pct);
@@ -185,7 +193,8 @@ impl StrategyEngine {
             }
 
             if age_min >= cfg.time_stop_minutes && mult < cfg.tp_1_multiplier {
-                warn!("⏰ Time stop {}min on {} at {:.2}x", age_min, &pos.mint[..pos.mint.len().min(8)], mult);
+                warn!("⏰ Time stop {}min on {} at {:.2}x",
+                      age_min, &pos.mint[..pos.mint.len().min(8)], mult);
                 self.fire_full_exit(&pos, pnl_pct).await?;
             }
         }
@@ -196,7 +205,9 @@ impl StrategyEngine {
         let b = 1.0; let q = 1.0 - win_prob;
         let kelly = (win_prob * b - q) / b;
         let half_kelly = (kelly * 0.5).max(0.0).min(0.25);
-        (available * half_kelly).min(self.config.wallet.max_position_size_sol).max(0.05)
+        (available * half_kelly)
+            .min(self.config.wallet.max_position_size_sol)
+            .max(0.05)
     }
 
     async fn fire_partial_sell(&self, pos: &Trade, pct: f64) -> Result<()> {
@@ -204,9 +215,20 @@ impl StrategyEngine {
         Ok(())
     }
 
+    /// FIX (Bug #5): do NOT call `redis.remove_open_position` here.
+    ///
+    /// The original code removed the position from Redis immediately after
+    /// sending the sell to the trade channel.  Because the channel is async,
+    /// the execution engine may not have processed the sell yet — the position
+    /// disappeared from Redis while the tokens were still held.
+    ///
+    /// The execution engine already calls `redis.remove_open_position` after a
+    /// successful sell bundle when `sell_pct >= 1.0` (see `execute_sell`).
+    /// Removing it here was both redundant and ordered incorrectly.
     async fn fire_full_exit(&self, pos: &Trade, pnl_pct: f64) -> Result<()> {
         self.fire_partial_sell(pos, 1.0).await?;
-        self.redis.remove_open_position(&pos.mint).await?;
+        // Position removal is now handled inside execute_sell after the sell
+        // bundle is accepted — not here.
         let track = format!("{:?}", pos.strategy_track).to_lowercase();
         record_trade_exited(pnl_pct, &track);
         Ok(())
@@ -243,8 +265,6 @@ impl StrategyEngine {
         Ok(self.redis.get_circuit_breaker_active().await.unwrap_or(false))
     }
 
-    /// Uses consecutive-loss count (not hourly count) so the breaker triggers
-    /// on a losing streak rather than scattered losses over an hour.
     async fn check_circuit_breaker(&self) -> Result<()> {
         let consecutive = self.db.count_consecutive_losses().await?;
         let cfg = &self.config.strategy;
