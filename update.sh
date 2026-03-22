@@ -34,18 +34,14 @@ if [ -d "$PROJECT_DIR/.git" ]; then
     success "Repo updated"
 else
     info "Cloning repo into $PROJECT_DIR..."
-    # Create parent dir if it doesn't exist (e.g. /mnt/d/ on WSL)
     mkdir -p "$(dirname "$PROJECT_DIR")"
     git clone "$REPO_URL" "$PROJECT_DIR"
     cd "$PROJECT_DIR"
     success "Repo cloned"
 fi
 
-# All subsequent steps run from the project root
 cd "$PROJECT_DIR"
 
-# Copy the patched files from the bot/ subfolder next to this script
-# (when the script is run straight from the extracted zip)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -d "$SCRIPT_DIR/src" ] && [ "$SCRIPT_DIR" != "$PROJECT_DIR" ]; then
     info "Copying patched files from zip into $PROJECT_DIR..."
@@ -92,7 +88,6 @@ check_tool() {
 check_tool cargo  "Install Rust: https://rustup.rs"
 check_tool python3 "Install Python 3.11+"
 
-# psql — install automatically if missing
 if command -v psql &>/dev/null; then
     success "psql found"
 else
@@ -112,19 +107,16 @@ header "Step 3/6 — Stopping bot"
 
 BOT_STOPPED=false
 
-# Try systemd first
 if systemctl is-active --quiet memecoin-bot 2>/dev/null; then
     info "Stopping systemd service memecoin-bot..."
     sudo systemctl stop memecoin-bot
     BOT_STOPPED=true
     success "Service stopped"
-# Try pm2
 elif command -v pm2 &>/dev/null && pm2 list 2>/dev/null | grep -q "bot"; then
     info "Stopping pm2 process..."
     pm2 stop bot 2>/dev/null || true
     BOT_STOPPED=true
     success "pm2 process stopped"
-# Try killing by binary name
 elif pgrep -x "bot" &>/dev/null; then
     info "Killing bot process..."
     pkill -x "bot" || true
@@ -138,7 +130,7 @@ fi
 # ── 4. Run database migration ─────────────────────────────────────────────────
 header "Step 4/6 — Database migration"
 
-MIGRATION="migrations/V99__autoresearch_columns.sql"
+MIGRATION="migrations/004_autoresearch_columns.sql"
 
 if [ ! -f "$MIGRATION" ]; then
     error "Migration file not found at $MIGRATION — make sure you extracted the zip into your project root"
@@ -148,7 +140,6 @@ info "Running $MIGRATION..."
 if psql "$DATABASE_URL" -f "$MIGRATION" 2>&1; then
     success "Migration applied"
 else
-    # Non-zero exit from psql — check if it's just "already exists" warnings
     OUTPUT=$(psql "$DATABASE_URL" -f "$MIGRATION" 2>&1 || true)
     if echo "$OUTPUT" | grep -qi "ERROR" && ! echo "$OUTPUT" | grep -qi "already exists"; then
         echo "$OUTPUT"
@@ -167,7 +158,6 @@ if [ ! -f "$REQUIREMENTS" ]; then
     error "Requirements file not found at $REQUIREMENTS"
 fi
 
-# Find the right pip/python
 if [ -f ".venv/bin/pip" ]; then
     PIP=".venv/bin/pip"
     info "Using existing virtualenv at .venv"
@@ -178,7 +168,7 @@ elif command -v uv &>/dev/null; then
     info "uv found — using for faster install"
     uv pip install -r "$REQUIREMENTS"
     success "Python dependencies installed"
-    PIP=""  # already done
+    PIP=""
 else
     PIP="pip3"
     warn "No virtualenv found — installing to system Python (consider using a venv)"
@@ -190,7 +180,6 @@ if [ -n "$PIP" ]; then
     success "Python dependencies installed"
 fi
 
-# Check ANTHROPIC_API_KEY is set (needed for autoresearch agent)
 if [ -z "$ANTHROPIC_API_KEY" ]; then
     warn "ANTHROPIC_API_KEY not set in .env — autoresearch agent won't work without it"
     warn "Add this to your .env: ANTHROPIC_API_KEY=sk-ant-..."
@@ -227,7 +216,7 @@ fi
 
 echo ""
 echo -e "${GREEN}${BOLD}All done! Summary of what was applied:${NC}"
-echo "  • Database migration V99 (autoresearch columns)"
+echo "  • Database migration 004 (autoresearch columns)"
 echo "  • Python deps for autoresearch dashboard"
 echo "  • Rust bot rebuilt with all bug fixes + ONNX model loading"
 echo ""
