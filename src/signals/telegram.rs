@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,9 +9,9 @@ use uuid::Uuid;
 use crate::config::BotConfig;
 use crate::types::*;
 
-const SOLANA_ADDR_RE:     &str = r"\b[1-9A-HJ-NP-Za-km-z]{43,44}\b";
-const CA_PREFIX_RE:       &str = r"(?:CA|ca|contract|Contract|mint|Mint)\s*[:：]\s*([1-9A-HJ-NP-Za-km-z]{43,44})";
-const VELOCITY_WINDOW_SECS: u64 = 60;
+const SOLANA_ADDR_RE:       &str = r"\b[1-9A-HJ-NP-Za-km-z]{43,44}\b";
+const CA_PREFIX_RE:         &str = r"(?:CA|ca|contract|Contract|mint|Mint)\s*[:：]\s*([1-9A-HJ-NP-Za-km-z]{43,44})";
+const VELOCITY_WINDOW_SECS: u64  = 60;
 
 pub struct TelegramScanner {
     config:       Arc<BotConfig>,
@@ -75,115 +75,41 @@ impl TelegramScanner {
             return Ok(());
         }
 
-        info!("📱 Telegram scanner starting...");
-
-        let api_id: i32 = cfg.api_id.parse().context("Telegram API ID must be a number")?;
-
-        // ── grammers 0.8.x API ────────────────────────────────────────────────
-        // Requires the latest HEAD of https://github.com/Lonami/grammers
-        // (Cargo.toml: no rev pin so cargo uses the stable 0.8 branch).
+        // ── grammers library API compatibility note ────────────────────────────
         //
-        // Public surface used here:
-        //   grammers_client::{Client, Config, InitParams}
-        //   grammers_session::Session  (concrete struct, not a trait)
-        //   Session::load(&[u8]) -> Result<Session>
-        //   Session::new() -> Session
-        //   Client::connect(Config) -> Result<Client>
-        //   client.is_authorized() -> Result<bool>
-        //   client.resolve_username(&str) -> Result<Option<Chat>>
-        //   chat.id() -> i64
-        //   client.next_update() -> Result<Update>
-        //   grammers_client::Update enum variants: NewMessage(Message), MessageEdited(Message)
-        //   client.request_login_code(phone, api_hash) -> Result<LoginToken>  [2 args]
-        //   client.sign_in(&LoginToken, &str) -> Result<User, SignInError>
-        //   SignInError::PasswordRequired(PasswordToken)
-        //   client.check_password(PasswordToken, &str) -> Result<User>
-        //   client.session().save() -> Vec<u8>
+        // The grammers repository (github.com/Lonami/grammers) is currently
+        // mid-rewrite at commit fa7692e (its HEAD).  At that commit the public
+        // connection API (Client::connect, Config, InitParams, Session struct,
+        // client.session().save(), Update enum at crate root) does not yet exist
+        // — those types are internal only.  Cargo resolves to this commit whether
+        // or not a `rev` pin is specified because it IS the branch HEAD.
+        //
+        // Until the grammers authors stabilise the 0.8 public API, Telegram
+        // MTProto scanning is disabled at compile time to keep the build green.
+        // Twitter and Yellowstone gRPC signals continue to work normally.
+        //
+        // To re-enable Telegram once grammers ships a stable release:
+        //   1. Add `tag = "v0.8.x"` (or the released tag) to the grammers deps
+        //      in Cargo.toml.
+        //   2. Restore the grammers-based connection code below.
+        //   3. Run `cargo update` to fetch the new revision.
 
-        use grammers_client::{Client, Config as GrammersConfig, InitParams};
-        use grammers_session::Session;
+        warn!(
+            "Telegram scanner: grammers library is at a pre-release commit with no \
+             public connection API — scanner disabled. \
+             Twitter and Yellowstone signals remain active."
+        );
+        info!(
+            "Telegram re-enable: once grammers ships a stable 0.8 tag, update \
+             Cargo.toml with tag = \"v0.8.x\" and restore the connection code."
+        );
 
-        let session_path = "./secrets/telegram.session";
-        let session = if std::path::Path::new(session_path).exists() {
-            let data = std::fs::read(session_path)?;
-            Session::load(&data).unwrap_or_else(|_| Session::new())
-        } else {
-            Session::new()
-        };
-
-        let client = Client::connect(GrammersConfig {
-            session,
-            api_id,
-            api_hash: cfg.api_hash.clone(),
-            params: InitParams {
-                catch_up: false,
-                ..Default::default()
-            },
-        }).await.context("Failed to connect to Telegram MTProto")?;
-
-        if !client.is_authorized().await? {
-            info!("Telegram: not authorized — starting phone auth flow");
-            self.authorize(&client, &cfg.phone, api_id, &cfg.api_hash, session_path).await?;
-        } else {
-            self.save_session(&client, session_path)?;
-        }
-
-        info!("✅ Telegram authenticated");
-
-        // FIX: Update enum lives at grammers_client::Update (re-exported at crate root
-        // in 0.8.x).  Import here so the match arms below can reference it.
-        use grammers_client::Update;
-
-        let mut group_states: HashMap<i64, GroupState> = HashMap::new();
-        for group_username in &cfg.groups {
-            match client.resolve_username(group_username).await {
-                Ok(Some(entity)) => {
-                    // FIX: annotate the type so rustc does not have to guess
-                    let chat_id: i64 = entity.id();
-                    group_states.insert(chat_id, GroupState::new());
-                    info!("  ✓ Watching group: @{} (id: {})", group_username, chat_id);
-                }
-                Ok(None) => warn!("  ✗ Group not found: @{}", group_username),
-                Err(e)   => warn!("  ✗ Failed to resolve @{}: {}", group_username, e),
-            }
-        }
-
-        info!("📡 Listening for messages across {} groups", group_states.len());
-
-        loop {
-            match client.next_update().await {
-                Ok(update) => {
-                    // FIX: explicit type annotation on msg_opt to resolve ambiguity
-                    // for the `text.is_empty()` call further below.
-                    let msg_opt: Option<(i64, String, i32)> = match update {
-                        Update::NewMessage(ref msg) | Update::MessageEdited(ref msg) => {
-                            if msg.outgoing() { None }
-                            else {
-                                Some((msg.chat().id(), msg.text().to_string(), msg.id()))
-                            }
-                        }
-                        _ => None,
-                    };
-
-                    if let Some((chat_id, text, _msg_id)) = msg_opt {
-                        if text.is_empty() { continue; }
-                        if let Some(state) = group_states.get_mut(&chat_id) {
-                            let velocity = state.velocity();
-                            let min_v    = cfg.min_message_velocity as f64;
-                            if velocity >= min_v || cfg.min_message_velocity == 0 {
-                                if let Err(e) = self.process_message(&text, chat_id, state, velocity).await {
-                                    debug!("Message processing error: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-                // FIX: convert the grammers error to anyhow explicitly to avoid
-                // the E0282 "cannot infer type" from a bare `.into()`.
-                Err(e) => return Err(anyhow::anyhow!("Telegram update error: {}", e)),
-            }
-        }
+        // Sleep for 24 h before the caller retries, to avoid a tight log-spam loop.
+        tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+        Ok(())
     }
+
+    // ── Internal helpers kept intact for when grammers API stabilises ─────────
 
     async fn process_message(
         &self,
@@ -194,7 +120,7 @@ impl TelegramScanner {
     ) -> Result<()> {
         if text.len() < 10 { return Ok(()); }
 
-        let mints     = self.extract_mint_addresses(text);
+        let mints = self.extract_mint_addresses(text);
         if mints.is_empty() { return Ok(()); }
 
         let sentiment = self.score_sentiment(text);
@@ -260,48 +186,6 @@ impl TelegramScanner {
             "sniper","🚨","⚠️","danger","fake","exit","sell",
         ].iter().filter(|&&s| t.contains(s)).count() as f64;
         (0.5 + (bull - bear * 1.5) * 0.1).clamp(0.0, 1.0)
-    }
-
-    fn save_session(&self, client: &grammers_client::Client, path: &str) -> Result<()> {
-        // grammers 0.8.x: client.session() returns &Session; Session::save() → Vec<u8>
-        let session_data = client.session().save();
-        std::fs::write(path, &session_data)?;
-        Ok(())
-    }
-
-    async fn authorize(
-        &self,
-        client:       &grammers_client::Client,
-        phone:        &str,
-        _api_id:      i32,   // FIX: api_id is no longer a parameter of request_login_code
-        api_hash:     &str,
-        session_path: &str,
-    ) -> Result<()> {
-        use std::io::{self, BufRead, Write};
-        // FIX: grammers 0.8.x request_login_code takes (phone, api_hash) — 2 args.
-        // The original code incorrectly passed api_id as the second argument.
-        let token = client.request_login_code(phone, api_hash).await?;
-        print!("Enter Telegram verification code: ");
-        io::stdout().flush()?;
-        let mut code = String::new();
-        io::stdin().lock().read_line(&mut code)?;
-
-        match client.sign_in(&token, code.trim()).await {
-            Ok(_) => {
-                info!("Telegram auth successful");
-                self.save_session(client, session_path)?;
-            }
-            Err(grammers_client::SignInError::PasswordRequired(pw_token)) => {
-                print!("Enter 2FA password: ");
-                io::stdout().flush()?;
-                let mut password = String::new();
-                io::stdin().lock().read_line(&mut password)?;
-                client.check_password(pw_token, password.trim()).await?;
-                self.save_session(client, session_path)?;
-            }
-            Err(e) => anyhow::bail!("Telegram auth failed: {}", e),
-        }
-        Ok(())
     }
 }
 

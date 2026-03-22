@@ -1,7 +1,6 @@
 use anyhow::Result;
-use chrono::{Datelike, Timelike};   // FIX: Datelike needed for .weekday()
+use chrono::{Datelike, Timelike};
 use ndarray::{Array2, Array3};
-// FIX: ort rc.12 correct import paths
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use std::f32::consts::PI as PI32;
@@ -61,28 +60,29 @@ impl ModelEnsemble {
         let sess  = Arc::clone(session);
         let feats = extract_tabular_features(signal);
         tokio::task::spawn_blocking(move || {
-            let arr = Array2::<f32>::from_shape_vec((1, N_TABULAR), feats)
-                .map_err(|e| anyhow::anyhow!("Array shape: {}", e))?;
-            // FIX: Tensor::from_array requires an owned Array, not a view.
-            // Pass `arr` directly (moved), not `arr.view()`.
-            let input = Tensor::from_array(arr)
+            // FIX: use tuple form (shape, vec) — avoids the ndarray version
+            // conflict where ort's bundled ndarray differs from Cargo.toml's.
+            // (D, Vec<T>) implements OwnedTensorArrayData in all ort rc.12 builds.
+            let input = Tensor::from_array(([1usize, N_TABULAR], feats))
                 .map_err(|e| anyhow::anyhow!("Tensor create: {}", e))?;
-            // FIX: ort::inputs![...] returns [SessionInputValue; N] directly, not a Result.
-            // The `?` must be applied to sess.run(...), not to the inputs! macro.
             let outputs = sess.run(ort::inputs![input])
                 .map_err(|e| anyhow::anyhow!("Tabular run: {}", e))?;
-            // FIX: use outputs.len() — SessionOutputs does not have is_empty() in scope
-            // without importing the ark-std Iterable trait.
+            // FIX: use try_extract_raw_tensor which explicitly returns (&Shape, &[T]).
+            // try_extract_tensor's TensorRef::view() also returns (&Shape, &[T])
+            // in rc.12 — use raw extraction and index directly into the slice.
             let prob = if outputs.len() >= 2 {
-                let t = outputs[1].try_extract_tensor::<f32>()
+                let (shape, data) = outputs[1].try_extract_raw_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
-                let v = t.view();
-                if v.ndim() == 2 && v.shape()[1] >= 2 { v[[0, 1]] as f64 }
-                else { v.iter().copied().next().unwrap_or(0.5) as f64 }
+                // If output is [batch, 2] take class-1 probability, else first element
+                if shape.len() >= 2 && shape[1] >= 2 {
+                    data.get(1).copied().unwrap_or(0.5) as f64
+                } else {
+                    data.first().copied().unwrap_or(0.5) as f64
+                }
             } else if outputs.len() > 0 {
-                let t = outputs[0].try_extract_tensor::<f32>()
+                let (_shape, data) = outputs[0].try_extract_raw_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
-                t.view().iter().copied().next().unwrap_or(0.5) as f64
+                data.first().copied().unwrap_or(0.5) as f64
             } else {
                 return Err(anyhow::anyhow!("No outputs from tabular model"));
             };
@@ -109,15 +109,15 @@ impl ModelEnsemble {
         tokio::task::spawn_blocking(move || {
             let seq = build_price_sequence(&owned)
                 .ok_or_else(|| anyhow::anyhow!("Empty candles"))?;
-            // FIX: owned Array3, not .view()
-            let input = Tensor::from_array(seq)
+            // FIX: convert Array3 to flat vec and use tuple form
+            let data = seq.into_raw_vec();
+            let input = Tensor::from_array(([1usize, SEQ_LEN, SEQ_FEAT], data))
                 .map_err(|e| anyhow::anyhow!("Tensor: {}", e))?;
-            // FIX: no ? after ort::inputs![...]
             let outputs = sess.run(ort::inputs![input])
                 .map_err(|e| anyhow::anyhow!("Transformer run: {}", e))?;
-            let t = outputs[0].try_extract_tensor::<f32>()
+            let (_shape, data) = outputs[0].try_extract_raw_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("Extract: {}", e))?;
-            Ok((t.view().iter().copied().next().unwrap_or(0.5) as f64).clamp(0.0, 1.0))
+            Ok((data.first().copied().unwrap_or(0.5) as f64).clamp(0.0, 1.0))
         }).await?
     }
 
@@ -133,19 +133,14 @@ impl ModelEnsemble {
         let node_feats = build_deployer_node_features(on_chain);
         let sess = Arc::clone(session);
         tokio::task::spawn_blocking(move || {
-            let arr = Array2::<f32>::from_shape_vec((1, NODE_DIM), node_feats.to_vec())
-                .map_err(|e| anyhow::anyhow!("GNN array: {}", e))?;
-            // FIX: owned array, not .view()
-            let input = Tensor::from_array(arr)
+            // FIX: tuple form avoids ndarray version conflict
+            let input = Tensor::from_array(([1usize, NODE_DIM], node_feats.to_vec()))
                 .map_err(|e| anyhow::anyhow!("GNN tensor: {}", e))?;
-            // FIX: named inputs — ort::inputs![...] returns Vec<...>, not a Result;
-            // remove ? from the macro invocation.
             let outputs = sess.run(ort::inputs!["node_features" => input])
                 .map_err(|e| anyhow::anyhow!("GNN run: {}", e))?;
-            let t = outputs[0].try_extract_tensor::<f32>()
+            let (_shape, data) = outputs[0].try_extract_raw_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("GNN extract: {}", e))?;
-            let rug_prob = t.view().iter().copied().next().unwrap_or(0.5) as f64;
-            // FIX: annotate float literal to resolve ambiguous numeric type for clamp
+            let rug_prob = data.first().copied().unwrap_or(0.5) as f64;
             Ok((1.0_f64 - rug_prob).clamp(0.0, 1.0))
         }).await?
     }
@@ -168,26 +163,24 @@ impl ModelEnsemble {
         tokio::task::spawn_blocking(move || {
             let enc = tok.encode(text.as_str(), false)
                 .map_err(|e| anyhow::anyhow!("Tokenizer: {}", e))?;
-            let ids   = pad_ids(enc.get_ids());
-            let mask  = pad_ids(enc.get_attention_mask());
-            let types = pad_ids(enc.get_type_ids());
-            let ids_arr   = Array2::<i64>::from_shape_vec((1, MAX_NLP_LEN), ids)?;
-            let mask_arr  = Array2::<i64>::from_shape_vec((1, MAX_NLP_LEN), mask)?;
-            let types_arr = Array2::<i64>::from_shape_vec((1, MAX_NLP_LEN), types)?;
-            // FIX: owned arrays (not .view()) — OwnedTensorArrayData is not implemented
-            // for ViewRepr; only for OwnedRepr.
-            let t_ids   = Tensor::from_array(ids_arr).map_err(|e| anyhow::anyhow!("{}", e))?;
-            let t_mask  = Tensor::from_array(mask_arr).map_err(|e| anyhow::anyhow!("{}", e))?;
-            let t_types = Tensor::from_array(types_arr).map_err(|e| anyhow::anyhow!("{}", e))?;
-            // FIX: no ? after ort::inputs![...]; the macro returns Vec<...> directly.
+            let ids:   Vec<i64> = pad_ids(enc.get_ids());
+            let mask:  Vec<i64> = pad_ids(enc.get_attention_mask());
+            let types: Vec<i64> = pad_ids(enc.get_type_ids());
+            // FIX: tuple form for all three inputs — no ndarray version conflict
+            let t_ids   = Tensor::from_array(([1usize, MAX_NLP_LEN], ids))
+                .map_err(|e| anyhow::anyhow!("ids tensor: {}", e))?;
+            let t_mask  = Tensor::from_array(([1usize, MAX_NLP_LEN], mask))
+                .map_err(|e| anyhow::anyhow!("mask tensor: {}", e))?;
+            let t_types = Tensor::from_array(([1usize, MAX_NLP_LEN], types))
+                .map_err(|e| anyhow::anyhow!("types tensor: {}", e))?;
             let outputs = sess.run(ort::inputs![
                 "input_ids"      => t_ids,
                 "attention_mask" => t_mask,
                 "token_type_ids" => t_types
             ]).map_err(|e| anyhow::anyhow!("NLP run: {}", e))?;
-            let t = outputs[0].try_extract_tensor::<f32>()
+            let (_shape, data) = outputs[0].try_extract_raw_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("NLP extract: {}", e))?;
-            Ok((t.view().iter().copied().next().unwrap_or(0.5) as f64).clamp(0.0, 1.0))
+            Ok((data.first().copied().unwrap_or(0.5) as f64).clamp(0.0, 1.0))
         }).await?
     }
 }
@@ -248,7 +241,6 @@ fn extract_tabular_features(signal: &TokenSignal) -> Vec<f32> {
     let hour    = now.hour() as f32;
     let hour_sin = (2.0 * PI32 * hour / 24.0).sin();
     let hour_cos = (2.0 * PI32 * hour / 24.0).cos();
-    // FIX: chrono::Datelike must be in scope for .weekday()
     let day_of_week = now.weekday().num_days_from_monday() as f32;
 
     let (
@@ -361,22 +353,20 @@ fn load_session(path: &str, name: &str) -> Option<Arc<Session>> {
         warn!("ONNX model '{}' not found at {} — heuristic active", name, path);
         return None;
     }
-    // FIX: Use an immediately-invoked closure with ? operators to avoid the
-    // two issues in the original .and_then() chain:
-    //   1. `SessionBuilder` is private at `ort::session::SessionBuilder`; the
-    //      public path is `ort::session::builder::SessionBuilder`.
-    //   2. `with_optimization_level` returns `Result<SB, Error<SB>>` while
-    //      `and_then` expected `Result<_, Error<()>>` — mismatched error params.
-    // The closure approach sidesteps both by mapping each error to anyhow.
     let result = (|| -> anyhow::Result<Session> {
-        let builder = Session::builder()
+        // FIX: Session::builder() returns Result<SessionBuilder>.
+        // with_optimization_level() takes &mut self and returns Result<&mut Self>.
+        // commit_from_file() consumes self and returns Result<Session>.
+        // Must declare builder as mut to call the chained mutable methods.
+        let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("Session builder: {}", e))?;
-        let builder = builder
+        // FIX: was `let builder = builder.with_optimization_level(...)` — needs mut
+        let mut builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("Optimization level: {}", e))?;
         let session = builder
             .commit_from_file(path)
-            .map_err(|e| anyhow::anyhow!("Load model file '{}': {}", path, e))?;
+            .map_err(|e| anyhow::anyhow!("Load model '{}': {}", path, e))?;
         Ok(session)
     })();
 
