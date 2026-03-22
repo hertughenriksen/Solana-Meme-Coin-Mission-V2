@@ -129,7 +129,7 @@ Helius free tier is sufficient for basic RPC. Yellowstone gRPC (on-chain scanner
 
 ```bash
 git clone https://github.com/hertughenriksen/Solana-Meme-Coin-Mission-V2
-cd solana-memecoin-bot
+cd Solana-Meme-Coin-Mission-V2
 chmod +x setup.sh
 ./setup.sh
 ```
