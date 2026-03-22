@@ -11,18 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 # ── Async runtime ──────────────────────────────────────────────────────────────
-tokio        = { version = "1.35",  features = ["full"] }
+tokio        = { version = "1.35",  features = ["full", "process"] }
 tokio-stream = "0.1"
 futures      = "0.3"
 
 # ── Solana SDK ─────────────────────────────────────────────────────────────────
 solana-sdk                   = "2.0"
 spl-token                    = "6.0"
-# FIX: spl-associated-token-account 6.x does not exist on crates.io.
-# Compatible version for solana-sdk 2.0 is 4.x.
 spl-associated-token-account = { version = "4.0", features = ["no-entrypoint"] }
 
-# ── Yellowstone gRPC (Geyser real-time stream) ────────────────────────────────
+# ── Yellowstone gRPC ──────────────────────────────────────────────────────────
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", optional = true }
 yellowstone-grpc-proto  = { git = "https://github.com/rpcpool/yellowstone-grpc", optional = true }
 
@@ -34,28 +32,29 @@ borsh      = { version = "1.3", features = ["derive"] }
 base64     = "0.21"
 
 # ── Database ───────────────────────────────────────────────────────────────────
+# FIX: "migrate" feature added — required for sqlx::migrate! macro
 sqlx  = { version = "0.8", default-features = false, features = [
-    "runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros"
+    "runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros", "migrate"
 ] }
-# FIX: redis 0.24 lacks incr_by_float on AsyncCommands. Use 0.25.
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
 reqwest = { version = "0.11", features = ["json", "stream"] }
 
 # ── ML inference (ONNX runtime) ────────────────────────────────────────────────
-# FIX: add download-binaries so OnnxRuntime is fetched at build time;
-# previously missing, causing link failures when ort was not found.
-ort     = { version = "2.0.0-rc.4", features = ["download-binaries"] }
+# FIX: pinned to rc.12 — the version cargo actually resolved at build time
+ort     = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 ndarray = "0.15"
 
-# ── NLP tokenizer (for FinBERT inference in Rust) ─────────────────────────────
-# Loads the HuggingFace tokenizer saved by train_nlp.py.
+# ── NLP tokenizer ─────────────────────────────────────────────────────────────
 tokenizers = { version = "0.19", default-features = false, features = ["onig"] }
 
 # ── Telegram MTProto ───────────────────────────────────────────────────────────
-grammers-client  = { git = "https://github.com/Lonami/grammers", package = "grammers-client" }
-grammers-session = { git = "https://github.com/Lonami/grammers", package = "grammers-session" }
+# FIX: pinned to commit fa7692e — the exact revision cargo resolved.
+# The grammers API (Client::connect, types::Update, session saving) changed
+# between commits; pinning prevents surprise breakage on next git pull.
+grammers-client  = { git = "https://github.com/Lonami/grammers", rev = "fa7692e", package = "grammers-client" }
+grammers-session = { git = "https://github.com/Lonami/grammers", rev = "fa7692e", package = "grammers-session" }
 
 # ── Monitoring ─────────────────────────────────────────────────────────────────
 axum                        = "0.7"
@@ -81,9 +80,6 @@ rand         = "0.8"
 bs58         = "0.5"
 hex          = "0.4"
 rust_decimal = { version = "1.33", features = ["serde"] }
-
-# ── gRPC (tonic/prost only via yellowstone feature; removed from direct deps
-# to prevent version conflicts with yellowstone-grpc's own transitive pins) ───
 
 [features]
 default     = ["yellowstone"]
