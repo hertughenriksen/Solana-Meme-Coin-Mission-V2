@@ -48,13 +48,13 @@ ndarray = "0.15"
 tokenizers = { version = "0.19", default-features = false, features = ["onig"] }
 
 # ── Telegram MTProto ───────────────────────────────────────────────────────────
-# FIX: removed rev = "fa7692e" — that commit pre-dates the stable 0.8 API surface
-# (Config, InitParams, Client::connect, Update enum at crate root).  Without a
-# rev pin cargo resolves the latest HEAD of the main branch which has the full
-# 0.8 API that the code expects.  Delete Cargo.lock and run `cargo update` after
-# applying this change so the new revision is fetched.
-grammers-client  = { git = "https://github.com/Lonami/grammers", package = "grammers-client" }
-grammers-session = { git = "https://github.com/Lonami/grammers", package = "grammers-session" }
+# grammers-client and grammers-session have been REMOVED.
+# The grammers library is at a pre-release commit (fa7692e) where the public
+# connection API (Client::connect, Config, InitParams, Session struct) does not
+# yet exist.  TelegramScanner::run() is stubbed to log a warning and sleep
+# until grammers ships a stable 0.8 tag.  Re-add these deps at that point:
+#   grammers-client  = { git = "https://github.com/Lonami/grammers", tag = "v0.8.x", package = "grammers-client" }
+#   grammers-session = { git = "https://github.com/Lonami/grammers", tag = "v0.8.x", package = "grammers-session" }
 
 # ── Monitoring ─────────────────────────────────────────────────────────────────
 axum                        = "0.7"
