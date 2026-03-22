@@ -14,7 +14,7 @@ mod strategy;
 mod execution;
 mod models;
 mod monitor;
-mod price_feed; // FIX: new module — polls Jupiter and keeps Redis price cache warm
+mod price_feed;
 mod types;
 
 use config::BotConfig;
@@ -46,7 +46,8 @@ async fn main() -> Result<()> {
     let config = Arc::new(BotConfig::load()?);
     info!("Config loaded | dry_run={}", config.bot.dry_run);
     if config.bot.dry_run {
-        warn!("⚠️  DRY RUN MODE — no real transactions will be sent");
+        warn!("⚠️  DRY RUN / TRAINING MODE — no real transactions will be sent");
+        info!("📊 Training dashboard: http://localhost:{}/training", config.monitor.dashboard_port);
     }
 
     info!("Connecting to PostgreSQL...");
@@ -73,14 +74,9 @@ async fn main() -> Result<()> {
     );
     let dashboard = Dashboard::new(config.clone(), db.clone(), redis.clone());
 
-    // ── Price feed (FIX: was missing — position manager needs live prices) ──
-    // Polls Jupiter every 2 s for all open positions + SOL/USD rate.
-    // Without this, get_cached_price() always returns None and every TP/SL
-    // check in manage_positions() silently skips.
+    // ── Price feed ────────────────────────────────────────────────────────
     let pf = PriceFeed::new(redis.clone());
-    tokio::spawn(async move {
-        pf.run().await;
-    });
+    tokio::spawn(async move { pf.run().await; });
     info!("✅ Price feed started");
 
     // ── Signal sources ────────────────────────────────────────────────────
@@ -179,7 +175,8 @@ async fn main() -> Result<()> {
     });
 
     info!("✅ All systems online");
-    info!("📊 Dashboard: http://localhost:{}", config.monitor.dashboard_port);
+    info!("📊 Live dashboard:     http://localhost:{}", config.monitor.dashboard_port);
+    info!("🧠 Training dashboard: http://localhost:{}/training", config.monitor.dashboard_port);
 
     let db_stats    = db.clone();
     let redis_stats = redis.clone();

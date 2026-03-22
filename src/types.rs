@@ -69,13 +69,13 @@ pub struct PreviousToken {
     pub peak_multiplier: f64,
 }
 
-/// FIX: added all outcome strings that `outcome_tracker.py` can write to the DB.
-/// The original enum only had 5 variants; Rust would panic when deserializing
-/// any token whose outcome was "pump", "fake_pump", "dump", etc.
+/// All outcome strings that `outcome_tracker.py` can write to the DB.
+/// Previously the enum only had 5 variants and would panic deserializing
+/// tokens labeled "pump", "fake_pump", "dump", etc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenOutcome {
-    // Original variants
+    // Core variants
     Rug,
     Honeypot,
     Inactive,
@@ -91,8 +91,8 @@ pub enum TokenOutcome {
 }
 
 impl TokenOutcome {
-    /// Returns true for any outcome that indicates the deployer acted badly.
-    /// Used by the GNN heuristic to penalise wallets with a history of bad launches.
+    /// True for any outcome that indicates the deployer acted badly.
+    /// Used by the GNN heuristic to penalise wallets with a bad launch history.
     pub fn is_negative(&self) -> bool {
         matches!(
             self,
@@ -216,4 +216,57 @@ pub struct SessionStats {
     pub signals_scanned: u64,
     pub signals_filtered_out: u64,
     pub jito_tips_paid_sol: f64,
+}
+
+// ── Training mode types ───────────────────────────────────────────────────────
+
+/// One row in the top-rejections breakdown shown on the training dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RejectionStat {
+    pub reason: String,
+    pub count: i64,
+}
+
+/// All stats shown on the training-mode dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TrainingStats {
+    /// Total tokens inserted into the `tokens` table (every signal that
+    /// reached the filter stage, regardless of outcome).
+    pub total_tokens: i64,
+
+    /// Subset whose `ml_label` has been assigned by `outcome_tracker.py`.
+    pub labeled_tokens: i64,
+
+    /// Tokens labeled 1 (pumped 2x within 30 min) — positive class.
+    pub positive_labels: i64,
+
+    /// Tokens labeled 0 (any other outcome) — negative class.
+    pub negative_labels: i64,
+
+    /// Wall-clock hours between the oldest and newest token in the DB.
+    /// Used to show progress toward the 2-week (336 h) training target.
+    pub hours_of_data: f64,
+
+    /// ISO-8601 timestamp when training / dry-run was first started.
+    pub collection_started_at: Option<DateTime<Utc>>,
+
+    /// Total rows in the `signals` table.
+    pub total_signals: i64,
+
+    pub twitter_signals: i64,
+    pub telegram_signals: i64,
+    pub yellowstone_signals: i64,
+    pub copy_trade_signals: i64,
+
+    /// How many tokens cleared every filter stage.
+    pub tokens_passed_filter: i64,
+
+    /// Average tokens seen per hour since collection started.
+    pub tokens_per_hour: f64,
+
+    /// Filter pass rate (0.0–1.0).
+    pub filter_pass_rate: f64,
+
+    /// Top N rejection reasons by frequency.
+    pub top_rejections: Vec<RejectionStat>,
 }

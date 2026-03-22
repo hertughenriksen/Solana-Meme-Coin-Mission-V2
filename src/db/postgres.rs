@@ -126,12 +126,81 @@ impl Database {
         })
     }
 
-    /// FIX: replaces the old `count_recent_losses(hours)` call in the circuit
-    /// breaker.  The config field is named `circuit_breaker_consecutive_losses`
-    /// but the previous implementation counted ALL losses in the last hour,
-    /// not consecutive ones.  This method fetches the 10 most-recent closed
-    /// trades in order and counts how many form an unbroken losing streak at
-    /// the head of that list.
+    /// Returns training-mode statistics used by the /training dashboard page.
+    /// Queries are broken into separate statements to avoid CASE WHEN type
+    /// inference issues with sqlx's compile-time checker.
+    pub async fn get_training_stats(&self) -> Result<TrainingStats> {
+        // ── Token counts ──────────────────────────────────────────────────────
+        let token_row = sqlx::query!(r#"
+            SELECT
+                COUNT(*)                                                   AS total_tokens,
+                COUNT(*) FILTER (WHERE ml_label IS NOT NULL)               AS labeled_tokens,
+                COUNT(*) FILTER (WHERE ml_label = 1)                       AS positive_labels,
+                COUNT(*) FILTER (WHERE ml_label = 0)                       AS negative_labels,
+                COUNT(*) FILTER (WHERE filter_passed = true)               AS tokens_passed,
+                COALESCE(
+                    EXTRACT(EPOCH FROM (MAX(first_seen_at) - MIN(first_seen_at))) / 3600.0,
+                    0.0
+                )                                                          AS hours_of_data
+            FROM tokens
+        "#).fetch_one(&self.pool).await?;
+
+        // ── Signal source breakdown ───────────────────────────────────────────
+        let sig_row = sqlx::query!(r#"
+            SELECT
+                COUNT(*)                                                   AS total_signals,
+                COUNT(*) FILTER (WHERE source = 'twitter')                 AS twitter,
+                COUNT(*) FILTER (WHERE source = 'telegram')                AS telegram,
+                COUNT(*) FILTER (WHERE source = 'yellowstone')             AS yellowstone,
+                COUNT(*) FILTER (WHERE source = 'copy_trade')              AS copy_trade
+            FROM signals
+        "#).fetch_one(&self.pool).await?;
+
+        // ── Top rejection reasons ─────────────────────────────────────────────
+        let rej_rows = sqlx::query!(r#"
+            SELECT
+                COALESCE(filter_rejection_reason, 'Unknown') AS reason,
+                COUNT(*)                                     AS cnt
+            FROM tokens
+            WHERE filter_rejection_reason IS NOT NULL
+            GROUP BY filter_rejection_reason
+            ORDER BY cnt DESC
+            LIMIT 8
+        "#).fetch_all(&self.pool).await?;
+
+        // ── Training session start ────────────────────────────────────────────
+        let session_row = sqlx::query!(
+            "SELECT started_at FROM training_sessions ORDER BY started_at ASC LIMIT 1"
+        ).fetch_optional(&self.pool).await?;
+
+        let total     = token_row.total_tokens.unwrap_or(0);
+        let passed    = token_row.tokens_passed.unwrap_or(0);
+        let hours     = token_row.hours_of_data.unwrap_or(0.0) as f64;
+
+        Ok(TrainingStats {
+            total_tokens:     total,
+            labeled_tokens:   token_row.labeled_tokens.unwrap_or(0),
+            positive_labels:  token_row.positive_labels.unwrap_or(0),
+            negative_labels:  token_row.negative_labels.unwrap_or(0),
+            hours_of_data:    hours,
+            collection_started_at: session_row.map(|r| r.started_at),
+            total_signals:    sig_row.total_signals.unwrap_or(0),
+            twitter_signals:  sig_row.twitter.unwrap_or(0),
+            telegram_signals: sig_row.telegram.unwrap_or(0),
+            yellowstone_signals: sig_row.yellowstone.unwrap_or(0),
+            copy_trade_signals:  sig_row.copy_trade.unwrap_or(0),
+            tokens_passed_filter: passed,
+            tokens_per_hour:  if hours > 0.0 { total as f64 / hours } else { 0.0 },
+            filter_pass_rate: if total > 0 { passed as f64 / total as f64 } else { 0.0 },
+            top_rejections: rej_rows.into_iter().map(|r| RejectionStat {
+                reason: r.reason.unwrap_or_default(),
+                count:  r.cnt.unwrap_or(0),
+            }).collect(),
+        })
+    }
+
+    /// Counts consecutive losses at the head of the closed-trade list.
+    /// A losing streak is broken the moment a winning trade is encountered.
     pub async fn count_consecutive_losses(&self) -> Result<i64> {
         let rows = sqlx::query!(
             r#"SELECT pnl_sol::float8 AS pnl_sol
@@ -145,13 +214,13 @@ impl Database {
         for row in rows {
             match row.pnl_sol {
                 Some(pnl) if pnl < 0.0 => count += 1,
-                _ => break, // streak broken by a win or null
+                _ => break,
             }
         }
         Ok(count)
     }
 
-    /// Kept for compatibility; circuit breaker now uses count_consecutive_losses.
+    /// Kept for compatibility — circuit breaker now uses count_consecutive_losses.
     pub async fn count_recent_losses(&self, hours: u32) -> Result<i64> {
         let row = sqlx::query!(
             "SELECT COUNT(*) as cnt FROM trades WHERE status='closed' AND pnl_sol < 0
@@ -161,9 +230,8 @@ impl Database {
         Ok(row.cnt.unwrap_or(0))
     }
 
-    /// FIX: now also persists `source_wallet` extracted from `CopyTradeData`
-    /// so that outcome_tracker.py can attribute wins/losses back to the
-    /// originating copy-trade wallet.
+    /// Persists `source_wallet` from `CopyTradeData` so outcome_tracker.py
+    /// can attribute wins/losses back to the originating copy-trade wallet.
     pub async fn log_signal(&self, signal: &TokenSignal, passed: bool, rejection: Option<&str>) -> Result<()> {
         let source_wallet: Option<&str> = signal
             .copy_trade

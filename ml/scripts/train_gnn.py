@@ -1,12 +1,23 @@
 """train_gnn.py — Temporal Graph Attention Network for rug pull detection.
 Usage: python ml/scripts/train_gnn.py --synthetic
        python ml/scripts/train_gnn.py --db-url $DATABASE_URL
+
+FIX: DataLoader was moved from torch_geometric.data to torch_geometric.loader
+     in PyTorch Geometric >= 2.0. This caused an ImportError crash on any
+     modern PyG installation. A try/except fallback handles both versions.
 """
 import argparse, json, logging, os
 from pathlib import Path
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
-from torch_geometric.data import Data, DataLoader
+from torch_geometric.data import Data
+
+# FIX: DataLoader import — PyG 2.0+ moved it to torch_geometric.loader
+try:
+    from torch_geometric.loader import DataLoader
+except ImportError:
+    from torch_geometric.data import DataLoader  # type: ignore[no-redef]
+
 from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool
 from sklearn.metrics import f1_score, roc_auc_score, recall_score
 
@@ -46,6 +57,7 @@ class WalletGATN(nn.Module):
         self.norms = nn.ModuleList([nn.LayerNorm(HIDDEN) for _ in range(LAYERS)])
         self.freq  = nn.Sequential(nn.Linear(HIDDEN*2, HIDDEN), nn.GELU(), nn.Linear(HIDDEN, HIDDEN//2), nn.GELU())
         self.cls   = nn.Sequential(nn.Linear(HIDDEN//2, 64), nn.GELU(), nn.Dropout(DROPOUT), nn.Linear(64, 1))
+
     def forward(self, data):
         x  = self.node_enc(data.x)
         ea = self.edge_enc(data.edge_attr)
