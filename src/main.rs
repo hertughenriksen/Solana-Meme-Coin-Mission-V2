@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, Timelike}; // required for .weekday() and .hour() on DateTime
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             let now = chrono::Utc::now();
+            // Datelike::weekday() and Timelike::hour() brought in at top of file
             if now.weekday() == chrono::Weekday::Sun && now.hour() == 2 {
                 info!("🔄 Starting scheduled model retraining...");
                 if let Err(e) = models::retrain_models().await {

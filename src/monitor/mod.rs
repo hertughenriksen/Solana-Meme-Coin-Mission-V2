@@ -4,6 +4,7 @@ use axum::{
     response::{Html, IntoResponse, Json},
     routing::get, Router,
 };
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::Arc;
 use tracing::info;
@@ -49,9 +50,10 @@ struct DState { db: Arc<Database>, redis: Arc<RedisClient> }
 async fn api_stats(State(s): State<Arc<DState>>) -> impl IntoResponse {
     match s.db.get_session_stats().await {
         Ok(stats) => {
-            metrics::gauge!("bot_win_rate").set(stats.win_rate);
-            metrics::gauge!("bot_pnl_sol").set(stats.total_pnl_sol);
-            metrics::gauge!("bot_open_positions").set(stats.open_positions as f64);
+            // metrics 0.22: macros return handle objects; call .set()/.increment()/.record()
+            gauge!("bot_win_rate").set(stats.win_rate);
+            gauge!("bot_pnl_sol").set(stats.total_pnl_sol);
+            gauge!("bot_open_positions").set(stats.open_positions as f64);
             Json(serde_json::to_value(&stats).unwrap()).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -119,13 +121,14 @@ th{{background:#1a1a2e;color:#9945FF;font-size:.72em;text-transform:uppercase;le
     ))
 }
 
+/// metrics 0.22: counter/histogram labels come before the method call, value goes in .increment()/.record()
 pub fn record_trade_entered(strategy: &str, sol: f64) {
-    metrics::counter!("bot_trades_entered", "strategy" => strategy.to_string()).increment(1);
-    metrics::histogram!("bot_trade_size_sol", "strategy" => strategy.to_string()).record(sol);
+    counter!("bot_trades_entered", "strategy" => strategy.to_string()).increment(1);
+    histogram!("bot_trade_size_sol", "strategy" => strategy.to_string()).record(sol);
 }
 
 pub fn record_trade_exited(pnl_pct: f64, strategy: &str) {
-    metrics::histogram!("bot_pnl_pct", "strategy" => strategy.to_string()).record(pnl_pct);
-    if pnl_pct > 0.0 { metrics::counter!("bot_wins",   "strategy" => strategy.to_string()).increment(1); }
-    else              { metrics::counter!("bot_losses", "strategy" => strategy.to_string()).increment(1); }
+    histogram!("bot_pnl_pct", "strategy" => strategy.to_string()).record(pnl_pct);
+    if pnl_pct > 0.0 { counter!("bot_wins",   "strategy" => strategy.to_string()).increment(1); }
+    else              { counter!("bot_losses", "strategy" => strategy.to_string()).increment(1); }
 }

@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{info, warn};
 
 use crate::config::BotConfig;
-use crate::types::*;
+use crate::types::TokenSignal;
 
 pub struct WalletTracker {
     config: Arc<BotConfig>,
@@ -41,6 +40,7 @@ impl WalletTracker {
         // When Helius gRPC is configured, this subscribes to transactions from
         // copy_wallets specifically and emits SmartWalletBuy signals.
         warn!("Wallet tracker: gRPC not yet implemented — configure Yellowstone gRPC to enable");
+        let _ = &self.signal_tx; // keep field live
         tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         Ok(())
     }

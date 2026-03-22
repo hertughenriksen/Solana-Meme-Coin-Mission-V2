@@ -4,7 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::BotConfig;
@@ -27,6 +27,7 @@ struct StreamEvent {
     matching_rules: Option<Vec<MatchingRule>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TweetData {
     id: String,
@@ -38,12 +39,15 @@ struct TweetData {
     referenced: Option<Vec<ReferencedTweet>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TweetMetrics { like_count: u64, retweet_count: u64, reply_count: u64 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct MatchingRule { id: String, tag: Option<String> }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ReferencedTweet { #[serde(rename = "type")] tweet_type: String, id: String }
 
@@ -219,16 +223,28 @@ impl TwitterScanner {
         let mut rules = Vec::new();
 
         if !cfg.kol_accounts.is_empty() {
-            let kol_clause = cfg.kol_accounts.iter().map(|id| format!("from:{}", id)).collect::<Vec<_>>().join(" OR ");
-            rules.push(StreamRule { value: format!("({}) has:links -is:retweet", kol_clause), tag: "kol_accounts".into() });
+            let kol_clause = cfg.kol_accounts.iter()
+                .map(|id| format!("from:{}", id)).collect::<Vec<_>>().join(" OR ");
+            rules.push(StreamRule {
+                value: format!("({}) has:links -is:retweet", kol_clause),
+                tag: "kol_accounts".into(),
+            });
         }
 
-        let keyword_clause = cfg.trigger_keywords.iter().map(|k| format!("\"{}\"", k)).collect::<Vec<_>>().join(" OR ");
-        rules.push(StreamRule { value: format!("({}) lang:en -is:retweet", keyword_clause), tag: "trigger_keywords".into() });
-        rules.push(StreamRule { value: "\"CA:\" OR \"contract:\" OR \"just launched\" lang:en -is:retweet".into(), tag: "ca_pattern".into() });
+        let keyword_clause = cfg.trigger_keywords.iter()
+            .map(|k| format!("\"{}\"", k)).collect::<Vec<_>>().join(" OR ");
+        rules.push(StreamRule {
+            value: format!("({}) lang:en -is:retweet", keyword_clause),
+            tag: "trigger_keywords".into(),
+        });
+        rules.push(StreamRule {
+            value: "\"CA:\" OR \"contract:\" OR \"just launched\" lang:en -is:retweet".into(),
+            tag: "ca_pattern".into(),
+        });
 
         let add_req = AddRulesRequest { add: rules };
-        let resp: serde_json::Value = self.http.post(rules_url).bearer_auth(bearer).json(&add_req).send().await?.json().await?;
+        let resp: serde_json::Value = self.http.post(rules_url)
+            .bearer_auth(bearer).json(&add_req).send().await?.json().await?;
         let rule_count = resp["data"].as_array().map(|a| a.len()).unwrap_or(0);
         info!("✅ Twitter stream rules set ({} rules active)", rule_count);
         Ok(())

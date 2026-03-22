@@ -3,21 +3,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BotConfig {
-    pub bot: BotSettings,
-    pub wallet: WalletSettings,
-    pub rpc: RpcSettings,
-    pub jito: JitoSettings,
-    pub bloxroute: BloxrouteSettings,
-    pub nozomi: NozomiSettings,
-    pub database: DatabaseSettings,
-    pub signals: SignalSettings,
-    pub filter: FilterSettings,
-    pub strategy: StrategySettings,
-    pub execution: ExecutionSettings,
-    pub models: ModelsConfig,
-    pub monitor: MonitorSettings,
+    pub bot: BotSettings, pub wallet: WalletSettings, pub rpc: RpcSettings,
+    pub jito: JitoSettings, pub bloxroute: BloxrouteSettings, pub nozomi: NozomiSettings,
+    pub database: DatabaseSettings, pub signals: SignalSettings, pub filter: FilterSettings,
+    pub strategy: StrategySettings, pub execution: ExecutionSettings,
+    pub models: ModelsConfig, pub monitor: MonitorSettings,
 }
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BotSettings {
     pub name: String, pub dry_run: bool, pub log_level: String,

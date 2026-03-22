@@ -15,7 +15,12 @@ pub struct FilterPipeline {
 }
 
 impl FilterPipeline {
-    pub fn new(config: Arc<BotConfig>, db: Arc<Database>, models: Arc<ModelEnsemble>, redis: Arc<RedisClient>) -> Self {
+    pub fn new(
+        config: Arc<BotConfig>,
+        db: Arc<Database>,
+        models: Arc<ModelEnsemble>,
+        redis: Arc<RedisClient>,
+    ) -> Self {
         Self { config, db, models, redis }
     }
 
@@ -23,7 +28,8 @@ impl FilterPipeline {
         let cfg = &self.config.filter;
 
         let mut result = FilterResult {
-            passed: false, rejection_reason: None,
+            passed: false,
+            rejection_reason: None,
             liquidity_ok: false, market_cap_ok: false, token_age_ok: false,
             dev_holding_ok: false, sniper_ok: false, mint_authority_ok: false,
             freeze_authority_ok: false, lp_lock_ok: false, creator_history_ok: false,
@@ -47,7 +53,9 @@ impl FilterPipeline {
         result.liquidity_ok = on_chain.liquidity_usd >= cfg.min_liquidity_usd
                            && on_chain.liquidity_usd <= cfg.max_liquidity_usd;
         if !result.liquidity_ok {
-            result.rejection_reason = Some(format!("Liquidity ${:.0} outside range", on_chain.liquidity_usd));
+            result.rejection_reason = Some(format!(
+                "Liquidity ${:.0} outside range", on_chain.liquidity_usd,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
@@ -55,7 +63,9 @@ impl FilterPipeline {
         result.market_cap_ok = on_chain.market_cap_usd >= cfg.min_market_cap_usd
                             && on_chain.market_cap_usd <= cfg.max_market_cap_usd;
         if !result.market_cap_ok {
-            result.rejection_reason = Some(format!("Market cap ${:.0} outside range", on_chain.market_cap_usd));
+            result.rejection_reason = Some(format!(
+                "Market cap ${:.0} outside range", on_chain.market_cap_usd,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
@@ -63,64 +73,84 @@ impl FilterPipeline {
         let age_hours = on_chain.token_age_seconds as f64 / 3600.0;
         result.token_age_ok = age_hours <= cfg.max_token_age_hours as f64;
         if !result.token_age_ok {
-            result.rejection_reason = Some(format!("Token age {:.1}h exceeds max {}h", age_hours, cfg.max_token_age_hours));
+            result.rejection_reason = Some(format!(
+                "Token age {:.1}h exceeds max {}h", age_hours, cfg.max_token_age_hours,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
         // Stage 4: Dev holding
         result.dev_holding_ok = on_chain.dev_holding_pct <= cfg.max_dev_holding_pct;
         if !result.dev_holding_ok {
-            result.rejection_reason = Some(format!("Dev holds {:.1}% > max {:.1}%", on_chain.dev_holding_pct * 100.0, cfg.max_dev_holding_pct * 100.0));
+            result.rejection_reason = Some(format!(
+                "Dev holds {:.1}% > max {:.1}%",
+                on_chain.dev_holding_pct * 100.0, cfg.max_dev_holding_pct * 100.0,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
         // Stage 5: Sniper concentration
         result.sniper_ok = on_chain.sniper_concentration_pct <= cfg.max_sniper_concentration_pct;
         if !result.sniper_ok {
-            result.rejection_reason = Some(format!("Sniper concentration {:.1}% exceeds {:.1}%", on_chain.sniper_concentration_pct * 100.0, cfg.max_sniper_concentration_pct * 100.0));
+            result.rejection_reason = Some(format!(
+                "Sniper concentration {:.1}% exceeds {:.1}%",
+                on_chain.sniper_concentration_pct * 100.0,
+                cfg.max_sniper_concentration_pct * 100.0,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
         // Stage 6: Mint authority
-        result.mint_authority_ok = !cfg.require_mint_authority_disabled || on_chain.mint_authority_disabled;
+        result.mint_authority_ok =
+            !cfg.require_mint_authority_disabled || on_chain.mint_authority_disabled;
         if !result.mint_authority_ok {
             result.rejection_reason = Some("Mint authority still enabled".into());
             return Ok(self.cache(result, &cache_key).await);
         }
 
         // Stage 7: Freeze authority
-        result.freeze_authority_ok = !cfg.require_freeze_authority_disabled || on_chain.freeze_authority_disabled;
+        result.freeze_authority_ok =
+            !cfg.require_freeze_authority_disabled || on_chain.freeze_authority_disabled;
         if !result.freeze_authority_ok {
             result.rejection_reason = Some("Freeze authority still enabled".into());
             return Ok(self.cache(result, &cache_key).await);
         }
 
         // Stage 8: LP lock
-        result.lp_lock_ok = on_chain.lp_locked && on_chain.lp_lock_days.unwrap_or(0) >= cfg.min_lp_lock_days;
+        result.lp_lock_ok = on_chain.lp_locked
+            && on_chain.lp_lock_days.unwrap_or(0) >= cfg.min_lp_lock_days;
         if !result.lp_lock_ok {
-            result.rejection_reason = Some(format!("LP not locked or lock < {} days", cfg.min_lp_lock_days));
+            result.rejection_reason = Some(format!(
+                "LP not locked or lock < {} days", cfg.min_lp_lock_days,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
         // Stage 9: Creator history (DB lookup)
-        let rug_count = self.db.get_deployer_rug_count(&on_chain.deployer_wallet).await?.unwrap_or(0);
+        let rug_count = self.db
+            .get_deployer_rug_count(&on_chain.deployer_wallet).await?
+            .unwrap_or(0);
         result.creator_history_ok = rug_count <= cfg.max_creator_rug_history;
         if !result.creator_history_ok {
-            result.rejection_reason = Some(format!("Deployer has {} previous rugs (max {})", rug_count, cfg.max_creator_rug_history));
+            result.rejection_reason = Some(format!(
+                "Deployer has {} previous rugs (max {})", rug_count, cfg.max_creator_rug_history,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
-        // Stage 10: Price impact
+        // Stage 10: Price impact (simplified AMM formula)
         let sell_amount_usd = on_chain.market_cap_usd * 0.05;
-        let reserve = on_chain.liquidity_usd / 2.0;
-        let price_impact = sell_amount_usd / (reserve + sell_amount_usd);
+        let reserve         = on_chain.liquidity_usd / 2.0;
+        let price_impact    = sell_amount_usd / (reserve + sell_amount_usd);
         result.price_impact_ok = price_impact <= cfg.max_price_impact_5pct_sell;
         if !result.price_impact_ok {
-            result.rejection_reason = Some(format!("5% sell would move price {:.1}% (illiquid trap)", price_impact * 100.0));
+            result.rejection_reason = Some(format!(
+                "5% sell would move price {:.1}% (illiquid trap)", price_impact * 100.0,
+            ));
             return Ok(self.cache(result, &cache_key).await);
         }
 
-        // Stage 11: ML ensemble (parallel)
+        // Stage 11: ML ensemble (all four models run in parallel)
         let (tab, trans, gnn, nlp) = tokio::join!(
             self.models.score_tabular(signal),
             self.models.score_transformer(signal),
@@ -145,7 +175,8 @@ impl FilterPipeline {
             result.rejection_reason = Some(format!(
                 "ML score {:.3} < threshold {:.3} | tab={:.2} trans={:.2} gnn={:.2} nlp={:.2}",
                 result.ensemble_score, cfg.min_win_probability,
-                result.tabular_score, result.transformer_score, result.gnn_score, result.nlp_score,
+                result.tabular_score, result.transformer_score,
+                result.gnn_score, result.nlp_score,
             ));
             let _ = self.redis.increment_signals_filtered_out().await;
             return Ok(self.cache(result, &cache_key).await);
@@ -154,10 +185,14 @@ impl FilterPipeline {
         result.passed = true;
         info!(
             "✅ PASS {} | ML={:.3} | liq=${:.0} | age={:.1}h | sniper={:.1}%",
-            &signal.mint[..8.min(signal.mint.len())], result.ensemble_score,
-            on_chain.liquidity_usd, age_hours, on_chain.sniper_concentration_pct * 100.0,
+            &signal.mint[..8.min(signal.mint.len())],
+            result.ensemble_score,
+            on_chain.liquidity_usd,
+            age_hours,
+            on_chain.sniper_concentration_pct * 100.0,
         );
 
+        // Log to DB without blocking the hot path
         {
             let db   = self.db.clone();
             let mint = signal.mint.clone();

@@ -14,13 +14,7 @@ impl RedisClient {
     pub async fn set_open_position(&self, mint: &str, trade: &Trade) -> Result<()> {
         let mut c = self.conn.clone();
         let _: () = c.set(format!("position:{}", mint), serde_json::to_string(trade)?).await?;
-        // Use INCRBYFLOAT via raw command since AsyncCommands doesn't expose it directly
-        let _: () = redis::cmd("INCRBYFLOAT")
-            .arg("capital_at_risk")
-            .arg(trade.entry_amount_sol)
-            .query_async(&mut c)
-            .await
-            .unwrap_or(());
+        let _: () = c.incr_by_float("capital_at_risk", trade.entry_amount_sol).await?;
         Ok(())
     }
 
@@ -29,12 +23,7 @@ impl RedisClient {
         let key = format!("position:{}", mint);
         if let Ok(json) = c.get::<_, String>(&key).await {
             if let Ok(trade) = serde_json::from_str::<Trade>(&json) {
-                let _: () = redis::cmd("INCRBYFLOAT")
-                    .arg("capital_at_risk")
-                    .arg(-trade.entry_amount_sol)
-                    .query_async(&mut c)
-                    .await
-                    .unwrap_or(());
+                let _: () = c.incr_by_float("capital_at_risk", -trade.entry_amount_sol).await.unwrap_or(());
             }
         }
         let _: () = c.del(&key).await?;

@@ -27,7 +27,10 @@ struct GroupState {
 
 impl GroupState {
     fn new() -> Self {
-        Self { message_timestamps: std::collections::VecDeque::new(), recent_mints: HashMap::new() }
+        Self {
+            message_timestamps: std::collections::VecDeque::new(),
+            recent_mints: HashMap::new(),
+        }
     }
 
     fn velocity(&mut self) -> f64 {
@@ -44,15 +47,20 @@ impl GroupState {
         let now = std::time::Instant::now();
         let cutoff = now - std::time::Duration::from_secs(300);
         self.recent_mints.retain(|_, &mut t| t > cutoff);
-        if self.recent_mints.contains_key(mint) { true }
-        else { self.recent_mints.insert(mint.to_string(), now); false }
+        if self.recent_mints.contains_key(mint) {
+            true
+        } else {
+            self.recent_mints.insert(mint.to_string(), now);
+            false
+        }
     }
 }
 
 impl TelegramScanner {
     pub fn new(config: Arc<BotConfig>, signal_tx: broadcast::Sender<TokenSignal>) -> Self {
         Self {
-            config, signal_tx,
+            config,
+            signal_tx,
             address_re: Regex::new(SOLANA_ADDR_RE).unwrap(),
             ca_prefix_re: Regex::new(CA_PREFIX_RE).unwrap(),
         }
@@ -111,7 +119,7 @@ impl TelegramScanner {
                 Ok(update) => {
                     if let Some(message) = self.extract_message_from_update(&update) {
                         if let Some(state) = group_states.get_mut(&message.chat_id) {
-                            let velocity    = state.velocity();
+                            let velocity     = state.velocity();
                             let min_velocity = cfg.min_message_velocity as f64;
                             if velocity >= min_velocity || cfg.min_message_velocity == 0 {
                                 if let Err(e) = self.process_message(&message, state, velocity).await {
@@ -121,14 +129,17 @@ impl TelegramScanner {
                         }
                     }
                 }
-                Err(e) => {
-                    return Err(e.into());
-                }
+                Err(e) => return Err(e.into()),
             }
         }
     }
 
-    async fn process_message(&self, message: &TelegramMessage, state: &mut GroupState, group_velocity: f64) -> Result<()> {
+    async fn process_message(
+        &self,
+        message: &TelegramMessage,
+        state: &mut GroupState,
+        group_velocity: f64,
+    ) -> Result<()> {
         let text = &message.text;
         if text.len() < 10 { return Ok(()); }
 
@@ -142,22 +153,32 @@ impl TelegramScanner {
             if state.has_seen_mint_recently(&mint) { continue; }
 
             let signal = TokenSignal {
-                id: Uuid::new_v4(), mint: mint.clone(),
+                id: Uuid::new_v4(),
+                mint: mint.clone(),
                 source: SignalSource::Telegram,
-                signal_type: if group_velocity > 20.0 { SignalType::CoordinatedMention } else { SignalType::SentimentSpike },
+                signal_type: if group_velocity > 20.0 {
+                    SignalType::CoordinatedMention
+                } else {
+                    SignalType::SentimentSpike
+                },
                 detected_at: chrono::Utc::now(),
                 on_chain: None,
                 social: Some(SocialData {
                     twitter_mentions_5m: 0, twitter_mentions_1h: 0,
                     telegram_mentions_5m: 1, telegram_mentions_1h: 1,
-                    sentiment_score: sentiment, sentiment_acceleration: (group_velocity / 10.0).min(1.0),
-                    kol_mention: false, kol_names: vec![],
+                    sentiment_score: sentiment,
+                    sentiment_acceleration: (group_velocity / 10.0).min(1.0),
+                    kol_mention: false,
+                    kol_names: vec![],
                     message_samples: vec![text.clone()],
                 }),
                 copy_trade: None,
             };
 
-            info!("📱 Telegram signal: {} | velocity: {:.0}/min | sentiment: {:.2}", &mint[..8.min(mint.len())], group_velocity, sentiment);
+            info!(
+                "📱 Telegram signal: {} | velocity: {:.0}/min | sentiment: {:.2}",
+                &mint[..8.min(mint.len())], group_velocity, sentiment,
+            );
             let _ = self.signal_tx.send(signal);
         }
         Ok(())
@@ -179,12 +200,14 @@ impl TelegramScanner {
 
     fn score_sentiment(&self, text: &str) -> f64 {
         let t = text.to_lowercase();
-        let bull: f64 = ["gem","launch","early","buy","pump","moon","alpha","call","fire","based",
-            "locked","100x","safe","legit","🚀","💎","🔥","✅","degen","ape","strong"]
-            .iter().filter(|&&s| t.contains(s)).count() as f64;
-        let bear: f64 = ["rug","scam","dump","avoid","honeypot","bot","bundled",
-            "sniper","🚨","⚠️","danger","fake","exit","sell"]
-            .iter().filter(|&&s| t.contains(s)).count() as f64;
+        let bull: f64 = [
+            "gem","launch","early","buy","pump","moon","alpha","call","fire","based",
+            "locked","100x","safe","legit","🚀","💎","🔥","✅","degen","ape","strong",
+        ].iter().filter(|&&s| t.contains(s)).count() as f64;
+        let bear: f64 = [
+            "rug","scam","dump","avoid","honeypot","bot","bundled",
+            "sniper","🚨","⚠️","danger","fake","exit","sell",
+        ].iter().filter(|&&s| t.contains(s)).count() as f64;
         (0.5 + (bull - bear * 1.5) * 0.1).clamp(0.0, 1.0)
     }
 
@@ -213,7 +236,10 @@ impl TelegramScanner {
         Ok(())
     }
 
-    fn extract_message_from_update(&self, update: &grammers_client::types::Update) -> Option<TelegramMessage> {
+    fn extract_message_from_update(
+        &self,
+        update: &grammers_client::types::Update,
+    ) -> Option<TelegramMessage> {
         use grammers_client::types::Update;
         match update {
             Update::NewMessage(msg) | Update::MessageEdited(msg) => {
@@ -234,18 +260,21 @@ impl TelegramScanner {
 
 struct TelegramMessage {
     chat_id: i64,
+    #[allow(dead_code)]
     sender_id: Option<i64>,
     text: String,
+    #[allow(dead_code)]
     message_id: i32,
 }
 
 fn is_known_program(addr: &str) -> bool {
-    matches!(addr,
-        "11111111111111111111111111111111" |
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" |
-        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" |
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" |
-        "So11111111111111111111111111111111111111112" |
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    matches!(
+        addr,
+        "11111111111111111111111111111111"
+            | "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            | "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+            | "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+            | "So11111111111111111111111111111111111111112"
+            | "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     )
 }

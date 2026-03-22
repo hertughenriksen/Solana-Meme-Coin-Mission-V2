@@ -37,6 +37,7 @@ impl SolanaRpcClient {
         Self { http, config, cache: Arc::new(RwLock::new(None)) }
     }
 
+    /// Spawns a background task that refreshes the cached blockhash every 15 s.
     pub fn spawn_blockhash_refresher(self: &Arc<Self>) {
         let client = Arc::clone(self);
         tokio::spawn(async move {
@@ -44,7 +45,10 @@ impl SolanaRpcClient {
             loop {
                 interval.tick().await;
                 if let Ok((hash, _)) = client.fetch_blockhash_from_rpc().await {
-                    *client.cache.write() = Some(BlockhashCache { blockhash: hash, refreshed_at: Instant::now() });
+                    *client.cache.write() = Some(BlockhashCache {
+                        blockhash: hash,
+                        refreshed_at: Instant::now(),
+                    });
                     debug!("Blockhash refreshed: {}", hash);
                 }
             }
@@ -59,14 +63,22 @@ impl SolanaRpcClient {
             }
         }
         let (hash, _) = self.fetch_blockhash_from_rpc().await?;
-        *self.cache.write() = Some(BlockhashCache { blockhash: hash, refreshed_at: Instant::now() });
+        *self.cache.write() = Some(BlockhashCache {
+            blockhash: hash,
+            refreshed_at: Instant::now(),
+        });
         Ok(hash)
     }
 
     async fn fetch_blockhash_from_rpc(&self) -> Result<(Hash, u64)> {
-        let body = json!({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"processed"}]});
-        let resp = self.call_with_failover(body).await?;
-        let hash_str = resp["result"]["value"]["blockhash"].as_str().context("No blockhash in response")?;
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getLatestBlockhash",
+            "params": [{"commitment": "processed"}],
+        });
+        let resp     = self.call_with_failover(body).await?;
+        let hash_str = resp["result"]["value"]["blockhash"]
+            .as_str().context("No blockhash in response")?;
         let slot     = resp["result"]["value"]["lastValidBlockHeight"].as_u64().unwrap_or(0);
         let hash     = Hash::from_str(hash_str).context("Invalid blockhash")?;
         Ok((hash, slot))
@@ -74,8 +86,9 @@ impl SolanaRpcClient {
 
     pub async fn get_token_balance(&self, owner: &str, mint: &str) -> Result<u64> {
         let body = json!({
-            "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
-            "params":[owner,{"mint":mint},{"encoding":"jsonParsed","commitment":"processed"}]
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "processed"}],
         });
         let resp     = self.call_with_failover(body).await?;
         let accounts = resp["result"]["value"].as_array().context("No accounts in response")?;
@@ -86,7 +99,11 @@ impl SolanaRpcClient {
     }
 
     pub async fn get_sol_balance(&self, address: &str) -> Result<u64> {
-        let body = json!({"jsonrpc":"2.0","id":1,"method":"getBalance","params":[address,{"commitment":"processed"}]});
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getBalance",
+            "params": [address, {"commitment": "processed"}],
+        });
         let resp = self.call_with_failover(body).await?;
         Ok(resp["result"]["value"].as_u64().unwrap_or(0))
     }
@@ -94,10 +111,15 @@ impl SolanaRpcClient {
     pub async fn confirm_transaction(&self, signature: &str, timeout_secs: u64) -> Result<bool> {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         while Instant::now() < deadline {
-            let body = json!({"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[[signature],{"searchTransactionHistory":false}]});
+            let body = json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignatureStatuses",
+                "params": [[signature], {"searchTransactionHistory": false}],
+            });
             if let Ok(resp) = self.call_with_failover(body).await {
                 if let Some(status) = resp["result"]["value"][0].as_object() {
-                    let conf = status.get("confirmationStatus").and_then(|v| v.as_str()).unwrap_or("");
+                    let conf = status.get("confirmationStatus")
+                        .and_then(|v| v.as_str()).unwrap_or("");
                     if conf == "confirmed" || conf == "finalized" {
                         if status.get("err").map(|e| !e.is_null()).unwrap_or(false) {
                             return Err(anyhow::anyhow!("Transaction failed on-chain"));
@@ -112,22 +134,42 @@ impl SolanaRpcClient {
     }
 
     pub async fn get_multiple_accounts(&self, pubkeys: &[&str]) -> Result<Vec<Option<Value>>> {
-        let body = json!({"jsonrpc":"2.0","id":1,"method":"getMultipleAccounts","params":[pubkeys,{"encoding":"base64","commitment":"processed"}]});
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getMultipleAccounts",
+            "params": [pubkeys, {"encoding": "base64", "commitment": "processed"}],
+        });
         let resp = self.call_with_failover(body).await?;
-        let list = resp["result"]["value"].as_array().context("No value array")?
-            .iter().map(|v| if v.is_null() { None } else { Some(v.clone()) }).collect();
+        let list = resp["result"]["value"]
+            .as_array().context("No value array")?
+            .iter()
+            .map(|v| if v.is_null() { None } else { Some(v.clone()) })
+            .collect();
         Ok(list)
     }
 
+    /// Helius DAS API — metadata, token extensions, etc.
     pub async fn get_asset_info(&self, mint: &str) -> Result<Value> {
-        let url = format!("https://mainnet.helius-rpc.com/?api-key={}", self.config.rpc.helius_api_key);
-        self.rpc_call(&url, json!({"jsonrpc":"2.0","id":1,"method":"getAsset","params":{"id":mint}})).await
+        let url = format!(
+            "https://mainnet.helius-rpc.com/?api-key={}",
+            self.config.rpc.helius_api_key,
+        );
+        self.rpc_call(&url, json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAsset",
+            "params": {"id": mint},
+        })).await
     }
 
     pub async fn get_token_largest_accounts(&self, mint: &str) -> Result<Vec<(String, u64)>> {
-        let body = json!({"jsonrpc":"2.0","id":1,"method":"getTokenLargestAccounts","params":[mint,{"commitment":"finalized"}]});
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenLargestAccounts",
+            "params": [mint, {"commitment": "finalized"}],
+        });
         let resp = self.call_with_failover(body).await?;
-        let holders = resp["result"]["value"].as_array().unwrap_or(&vec![])
+        let holders = resp["result"]["value"]
+            .as_array().unwrap_or(&vec![])
             .iter()
             .filter_map(|h| {
                 let address = h["address"].as_str()?.to_string();
@@ -156,8 +198,12 @@ impl SolanaRpcClient {
 
     fn endpoints(&self) -> Vec<String> {
         let cfg = &self.config.rpc;
-        let mut eps = vec![format!("https://mainnet.helius-rpc.com/?api-key={}", cfg.helius_api_key)];
-        if !cfg.quicknode_url.starts_with("YOUR_") { eps.push(cfg.quicknode_url.clone()); }
+        let mut eps = vec![
+            format!("https://mainnet.helius-rpc.com/?api-key={}", cfg.helius_api_key),
+        ];
+        if !cfg.quicknode_url.starts_with("YOUR_") {
+            eps.push(cfg.quicknode_url.clone());
+        }
         if !cfg.shyft_api_key.starts_with("YOUR_") {
             eps.push(format!("https://rpc.shyft.to/?api_key={}", cfg.shyft_api_key));
         }

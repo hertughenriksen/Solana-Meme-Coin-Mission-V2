@@ -3,7 +3,6 @@ pub mod rpc_client;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -105,7 +104,7 @@ impl ExecutionEngine {
 
         info!("🚀 BUY {} | {:.4} SOL | tip {} lamports | via {} engines", &mint[..8], decision.buy_amount_sol, tip_lamports, self.config.jito.block_engines.len());
 
-        let results    = self.submit_bundle_parallel(&bundle).await;
+        let results      = self.submit_bundle_parallel(&bundle).await;
         let any_accepted = results.iter().any(|r| r.is_ok());
 
         let _ = self.redis.record_bundle_submitted().await;
@@ -194,19 +193,19 @@ impl ExecutionEngine {
             DexType::PumpFun | DexType::PumpSwap => {
                 let (bonding_curve, _) = derive_pump_fun_bonding_curve(&mint_pubkey);
                 let bc_ata = spl_associated_token_account::get_associated_token_address(&bonding_curve, &mint_pubkey);
-                let price_usd    = on_chain.price_usd.max(1e-10);
+                let price_usd     = on_chain.price_usd.max(1e-10);
                 let sol_price_usd = self.get_sol_price_usd().await;
                 build_pump_fun_buy(&mint_pubkey, &bonding_curve, &bc_ata, &user, sol_lamports, slippage_bps, price_usd, sol_price_usd)
             }
             DexType::RaydiumCPMM => {
-                let pool_state = solana_sdk::pubkey::Pubkey::from_str(&on_chain.pool_address).unwrap_or_default();
+                let pool_state = Pubkey::from_str(&on_chain.pool_address).unwrap_or_default();
                 let (token0_vault, token1_vault) = self.fetch_raydium_cpmm_vaults(&on_chain.pool_address).await?;
-                let wsol_mint = solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?;
+                let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
                 let pool = CpmmPoolAccounts {
-                    pool_id: pool_state, pool_authority: solana_sdk::pubkey::Pubkey::from_str(RAYDIUM_CPMM_AUTHORITY)?,
+                    pool_id: pool_state, pool_authority: Pubkey::from_str(RAYDIUM_CPMM_AUTHORITY)?,
                     pool_state, token0_mint: wsol_mint, token1_mint: mint_pubkey,
-                    token0_vault, token1_vault, lp_mint: solana_sdk::pubkey::Pubkey::default(),
-                    observation_key: solana_sdk::pubkey::Pubkey::default(),
+                    token0_vault, token1_vault, lp_mint: Pubkey::default(),
+                    observation_key: Pubkey::default(),
                 };
                 let min_out = apply_slippage(self.estimate_token_out(sol_lamports, on_chain), slippage_bps);
                 build_raydium_cpmm_swap(&pool, &user, sol_lamports, min_out, true)
@@ -231,19 +230,19 @@ impl ExecutionEngine {
             DexType::PumpFun | DexType::PumpSwap => {
                 let (bonding_curve, _) = derive_pump_fun_bonding_curve(&mint_pubkey);
                 let bc_ata = spl_associated_token_account::get_associated_token_address(&bonding_curve, &mint_pubkey);
-                let price_usd    = on_chain.price_usd.max(1e-10);
+                let price_usd     = on_chain.price_usd.max(1e-10);
                 let sol_price_usd = self.get_sol_price_usd().await;
                 build_pump_fun_sell(&mint_pubkey, &bonding_curve, &bc_ata, &user, token_amount, slippage_bps, price_usd, sol_price_usd)
             }
             DexType::RaydiumCPMM => {
-                let pool_state = solana_sdk::pubkey::Pubkey::from_str(&on_chain.pool_address).unwrap_or_default();
+                let pool_state = Pubkey::from_str(&on_chain.pool_address).unwrap_or_default();
                 let (token0_vault, token1_vault) = self.fetch_raydium_cpmm_vaults(&on_chain.pool_address).await?;
-                let wsol_mint = solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?;
+                let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
                 let pool = CpmmPoolAccounts {
-                    pool_id: pool_state, pool_authority: solana_sdk::pubkey::Pubkey::from_str(RAYDIUM_CPMM_AUTHORITY)?,
+                    pool_id: pool_state, pool_authority: Pubkey::from_str(RAYDIUM_CPMM_AUTHORITY)?,
                     pool_state, token0_mint: wsol_mint, token1_mint: mint_pubkey,
-                    token0_vault, token1_vault, lp_mint: solana_sdk::pubkey::Pubkey::default(),
-                    observation_key: solana_sdk::pubkey::Pubkey::default(),
+                    token0_vault, token1_vault, lp_mint: Pubkey::default(),
+                    observation_key: Pubkey::default(),
                 };
                 let sol_estimate = self.estimate_sol_out(token_amount, on_chain);
                 let min_sol_out  = apply_slippage(sol_estimate, slippage_bps);
@@ -254,8 +253,13 @@ impl ExecutionEngine {
     }
 
     async fn build_jupiter_swap_ix(&self, mint: &str, amount: u64, slippage_bps: u32, is_buy: bool) -> Result<solana_sdk::instruction::Instruction> {
+        use std::str::FromStr;
+
         let (input_mint, output_mint) = if is_buy { (WSOL_MINT, mint) } else { (mint, WSOL_MINT) };
-        let quote_url = format!("https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}", input_mint, output_mint, amount, slippage_bps);
+        let quote_url = format!(
+            "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+            input_mint, output_mint, amount, slippage_bps,
+        );
         let quote: serde_json::Value = self.http.get(&quote_url).send().await?.json().await?;
 
         let swap_body = serde_json::json!({
@@ -265,10 +269,12 @@ impl ExecutionEngine {
             "skipUserAccountsRpcCalls": true,
             "dynamicComputeUnitLimit": false,
         });
-        let swap_resp: serde_json::Value = self.http.post("https://quote-api.jup.ag/v6/swap-instructions").json(&swap_body).send().await?.json().await?;
+        let swap_resp: serde_json::Value = self.http
+            .post("https://quote-api.jup.ag/v6/swap-instructions")
+            .json(&swap_body).send().await?.json().await?;
 
-        let tx_b64    = swap_resp["swapTransaction"].as_str().context("No swapTransaction in Jupiter response")?;
-        let tx_bytes  = base64::engine::general_purpose::STANDARD.decode(tx_b64)?;
+        let tx_b64   = swap_resp["swapTransaction"].as_str().context("No swapTransaction in Jupiter response")?;
+        let tx_bytes = base64::engine::general_purpose::STANDARD.decode(tx_b64)?;
         let tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&tx_bytes)?;
 
         let message      = tx.message;
@@ -279,9 +285,17 @@ impl ExecutionEngine {
             let prog = account_keys.get(ix.program_id_index as usize).copied().unwrap_or_default();
             if prog != compute_prog {
                 let accounts: Vec<solana_sdk::instruction::AccountMeta> = ix.accounts.iter()
-                    .map(|&idx| solana_sdk::instruction::AccountMeta { pubkey: account_keys[idx as usize], is_signer: false, is_writable: true })
+                    .map(|&idx| solana_sdk::instruction::AccountMeta {
+                        pubkey: account_keys[idx as usize],
+                        is_signer: false,
+                        is_writable: true,
+                    })
                     .collect();
-                return Ok(solana_sdk::instruction::Instruction { program_id: prog, accounts, data: ix.data.clone() });
+                return Ok(solana_sdk::instruction::Instruction {
+                    program_id: prog,
+                    accounts,
+                    data: ix.data.clone(),
+                });
             }
         }
         anyhow::bail!("Could not extract swap instruction from Jupiter transaction")
@@ -295,7 +309,9 @@ impl ExecutionEngine {
             tip_lamports,
         );
         let all_ixs = [instructions, vec![tip_ix]].concat();
-        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(&all_ixs, Some(&self.keypair.pubkey()), &[&self.keypair], blockhash);
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &all_ixs, Some(&self.keypair.pubkey()), &[&self.keypair], blockhash,
+        );
         let tx_bytes = bincode::serialize(&tx)?;
         let tx_b64   = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
         Ok(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[[tx_b64]]}))
@@ -307,9 +323,13 @@ impl ExecutionEngine {
             let bundle = bundle.clone();
             let ep = ep.clone();
             async move {
-                let resp: serde_json::Value = client.post(&ep).json(&bundle).timeout(Duration::from_secs(4)).send().await?.json().await?;
-                if let Some(result) = resp.get("result") { Ok(result.as_str().unwrap_or("").to_string()) }
-                else { Err(anyhow::anyhow!("Jito: {}", resp.get("error").unwrap_or(&serde_json::Value::Null))) }
+                let resp: serde_json::Value = client.post(&ep)
+                    .json(&bundle).timeout(Duration::from_secs(4)).send().await?.json().await?;
+                if let Some(result) = resp.get("result") {
+                    Ok(result.as_str().unwrap_or("").to_string())
+                } else {
+                    Err(anyhow::anyhow!("Jito: {}", resp.get("error").unwrap_or(&serde_json::Value::Null)))
+                }
             }
         }).collect();
         futures::future::join_all(futs).await
@@ -317,7 +337,9 @@ impl ExecutionEngine {
 
     async fn submit_to_bloxroute(&self, bundle: &serde_json::Value) -> Result<()> {
         let cfg = &self.config.bloxroute;
-        self.http.post(&cfg.endpoint).header("Authorization", &cfg.auth_header).json(bundle).timeout(Duration::from_secs(4)).send().await?;
+        self.http.post(&cfg.endpoint)
+            .header("Authorization", &cfg.auth_header)
+            .json(bundle).timeout(Duration::from_secs(4)).send().await?;
         Ok(())
     }
 
@@ -332,10 +354,11 @@ impl ExecutionEngine {
                 let sol_lamports = (decision.buy_amount_sol * 1e9) as u64;
                 if let Ok(swap_ix) = self.build_buy_instruction(&decision.signal.mint, on_chain, sol_lamports, new_slippage).await {
                     let blockhash = self.rpc.get_latest_blockhash().await?;
-                    let tip = self.calculate_tip(decision.buy_amount_sol).await;
-                    let bundle = self.build_jito_bundle(
+                    let tip       = self.calculate_tip(decision.buy_amount_sol).await;
+                    let bundle    = self.build_jito_bundle(
                         vec![set_compute_unit_limit(300_000), set_compute_unit_price(self.micro_lamports_per_cu()), swap_ix],
-                        tip, blockhash).await?;
+                        tip, blockhash,
+                    ).await?;
                     let results = self.submit_bundle_parallel(&bundle).await;
                     if results.iter().any(|r| r.is_ok()) {
                         info!("✅ Retry {} succeeded for {}", attempt, &decision.signal.mint[..8]);
@@ -350,7 +373,7 @@ impl ExecutionEngine {
 
     async fn calculate_tip(&self, buy_sol: f64) -> u64 {
         let cfg = &self.config.jito;
-        let expected_profit = (buy_sol * 1.0 * 1e9) as u64;
+        let expected_profit = (buy_sol * 1e9) as u64;
         let base_tip = (expected_profit as f64 * cfg.tip_profit_share) as u64;
         let multiplier = self.redis.get_network_congestion_multiplier().await.unwrap_or(1.0);
         ((base_tip as f64 * multiplier) as u64).clamp(cfg.tip_min_lamports, cfg.tip_max_lamports)
@@ -358,7 +381,8 @@ impl ExecutionEngine {
 
     fn micro_lamports_per_cu(&self) -> u64 { 5_000 }
 
-    async fn has_price_dumped(&self, mint: &str, _threshold: f64) -> Result<bool> { Ok(false) }
+    /// Stub — always returns false until price-feed integration is wired up.
+    async fn has_price_dumped(&self, _mint: &str, _threshold: f64) -> Result<bool> { Ok(false) }
 
     async fn get_sol_price_usd(&self) -> f64 {
         self.redis.get_cached_price("SOL").await.unwrap_or(160.0)
@@ -388,11 +412,15 @@ impl ExecutionEngine {
                 }
             }
         }
-        let pool_pk  = solana_sdk::pubkey::Pubkey::from_str(pool_address)?;
+        let pool_pk   = solana_sdk::pubkey::Pubkey::from_str(pool_address)?;
         let wsol_mint = solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?;
-        let cpmm     = solana_sdk::pubkey::Pubkey::from_str(RAYDIUM_CPMM_PROGRAM_ID)?;
-        let (v0, _)  = solana_sdk::pubkey::Pubkey::find_program_address(&[b"pool_vault", pool_pk.as_ref(), wsol_mint.as_ref()], &cpmm);
-        let (v1, _)  = solana_sdk::pubkey::Pubkey::find_program_address(&[b"pool_vault", pool_pk.as_ref(), pool_pk.as_ref()], &cpmm);
+        let cpmm      = solana_sdk::pubkey::Pubkey::from_str(RAYDIUM_CPMM_PROGRAM_ID)?;
+        let (v0, _)   = solana_sdk::pubkey::Pubkey::find_program_address(
+            &[b"pool_vault", pool_pk.as_ref(), wsol_mint.as_ref()], &cpmm,
+        );
+        let (v1, _)   = solana_sdk::pubkey::Pubkey::find_program_address(
+            &[b"pool_vault", pool_pk.as_ref(), pool_pk.as_ref()], &cpmm,
+        );
         Ok((v0, v1))
     }
 
@@ -403,19 +431,30 @@ impl ExecutionEngine {
             if let Some(data_b64) = account["data"][0].as_str() {
                 let data = base64::engine::general_purpose::STANDARD.decode(data_b64)?;
                 if data.len() >= 288 {
-                    let parse_pk = |slice: &[u8]| solana_sdk::pubkey::Pubkey::from(<[u8; 32]>::try_from(slice).unwrap_or([0u8;32]));
+                    let parse_pk = |slice: &[u8]| {
+                        solana_sdk::pubkey::Pubkey::from(<[u8; 32]>::try_from(slice).unwrap_or([0u8; 32]))
+                    };
                     let amm_pk   = solana_sdk::pubkey::Pubkey::from_str(pool_address)?;
                     let amm_prog = solana_sdk::pubkey::Pubkey::from_str(RAYDIUM_AMM_PROGRAM_ID)?;
-                    let (authority, _) = solana_sdk::pubkey::Pubkey::find_program_address(&[b"amm authority"], &amm_prog);
+                    let (authority, _) = solana_sdk::pubkey::Pubkey::find_program_address(
+                        &[b"amm authority"], &amm_prog,
+                    );
                     return Ok(AmmV4PoolAccounts {
                         amm_id: amm_pk, amm_authority: authority,
-                        amm_open_orders: parse_pk(&data[32..64]), amm_target_orders: parse_pk(&data[64..96]),
-                        pool_coin_token_account: parse_pk(&data[96..128]), pool_pc_token_account: parse_pk(&data[128..160]),
-                        serum_program_id: parse_pk(&data[256..288]), serum_market: parse_pk(&data[224..256]),
-                        serum_bids: solana_sdk::pubkey::Pubkey::default(), serum_asks: solana_sdk::pubkey::Pubkey::default(),
-                        serum_event_queue: solana_sdk::pubkey::Pubkey::default(), serum_coin_vault: solana_sdk::pubkey::Pubkey::default(),
-                        serum_pc_vault: solana_sdk::pubkey::Pubkey::default(), serum_vault_signer: solana_sdk::pubkey::Pubkey::default(),
-                        base_mint: solana_sdk::pubkey::Pubkey::default(), quote_mint: solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?,
+                        amm_open_orders:        parse_pk(&data[32..64]),
+                        amm_target_orders:      parse_pk(&data[64..96]),
+                        pool_coin_token_account: parse_pk(&data[96..128]),
+                        pool_pc_token_account:  parse_pk(&data[128..160]),
+                        serum_program_id:       parse_pk(&data[256..288]),
+                        serum_market:           parse_pk(&data[224..256]),
+                        serum_bids:         solana_sdk::pubkey::Pubkey::default(),
+                        serum_asks:         solana_sdk::pubkey::Pubkey::default(),
+                        serum_event_queue:  solana_sdk::pubkey::Pubkey::default(),
+                        serum_coin_vault:   solana_sdk::pubkey::Pubkey::default(),
+                        serum_pc_vault:     solana_sdk::pubkey::Pubkey::default(),
+                        serum_vault_signer: solana_sdk::pubkey::Pubkey::default(),
+                        base_mint:          solana_sdk::pubkey::Pubkey::default(),
+                        quote_mint:         solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT)?,
                     });
                 }
             }

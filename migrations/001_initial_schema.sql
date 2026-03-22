@@ -90,19 +90,19 @@ CREATE TABLE IF NOT EXISTS copy_wallets (
 );
 
 CREATE TABLE IF NOT EXISTS signals (
-    id                  UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-    mint                VARCHAR(44) NOT NULL,
-    source              VARCHAR(20) NOT NULL,
-    signal_type         VARCHAR(30) NOT NULL,
-    detected_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    id                   UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+    mint                 VARCHAR(44) NOT NULL,
+    source               VARCHAR(20) NOT NULL,
+    signal_type          VARCHAR(30) NOT NULL,
+    detected_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     twitter_mentions_5m  INTEGER,
     telegram_mentions_5m INTEGER,
     sentiment_score      DECIMAL(5,4),
     kol_mention          BOOLEAN DEFAULT FALSE,
-    traded              BOOLEAN     DEFAULT FALSE,
-    trade_id            UUID        REFERENCES trades(id),
-    filter_passed       BOOLEAN,
-    filter_rejection    TEXT
+    traded               BOOLEAN     DEFAULT FALSE,
+    trade_id             UUID        REFERENCES trades(id),
+    filter_passed        BOOLEAN,
+    filter_rejection     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_signals_mint        ON signals(mint);
 CREATE INDEX IF NOT EXISTS idx_signals_source      ON signals(source);
@@ -140,14 +140,18 @@ WHERE created_at >= NOW() - INTERVAL '24 hours';
 CREATE OR REPLACE FUNCTION update_deployer_stats() RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.outcome IS NOT NULL AND OLD.outcome IS NULL AND NEW.deployer_wallet IS NOT NULL THEN
-        INSERT INTO deployer_wallets (wallet, first_seen_at) VALUES (NEW.deployer_wallet, NOW())
+        INSERT INTO deployer_wallets (wallet, first_seen_at)
+        VALUES (NEW.deployer_wallet, NOW())
         ON CONFLICT (wallet) DO NOTHING;
+
         UPDATE deployer_wallets SET
             total_tokens = total_tokens + 1,
             rug_count    = rug_count  + CASE WHEN NEW.outcome IN ('rug','honeypot') THEN 1 ELSE 0 END,
             pump_count   = pump_count + CASE WHEN NEW.outcome = 'pump'             THEN 1 ELSE 0 END,
-            rug_rate     = (rug_count + CASE WHEN NEW.outcome IN ('rug','honeypot') THEN 1 ELSE 0 END)::DECIMAL / NULLIF(total_tokens + 1, 0),
-            last_activity = NOW(), updated_at = NOW()
+            rug_rate     = (rug_count + CASE WHEN NEW.outcome IN ('rug','honeypot') THEN 1 ELSE 0 END)::DECIMAL
+                           / NULLIF(total_tokens + 1, 0),
+            last_activity = NOW(),
+            updated_at    = NOW()
         WHERE wallet = NEW.deployer_wallet;
     END IF;
     RETURN NEW;
@@ -155,7 +159,12 @@ END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_token_outcome ON tokens;
-CREATE TRIGGER trg_token_outcome AFTER UPDATE ON tokens FOR EACH ROW EXECUTE FUNCTION update_deployer_stats();
+CREATE TRIGGER trg_token_outcome
+    AFTER UPDATE ON tokens
+    FOR EACH ROW
+    EXECUTE FUNCTION update_deployer_stats();
 
-CREATE INDEX IF NOT EXISTS idx_tokens_outcome_label ON tokens(outcome, ml_label) WHERE ml_label IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_tokens_deployer_outcome ON tokens(deployer_wallet, outcome) WHERE deployer_wallet IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tokens_outcome_label
+    ON tokens(outcome, ml_label) WHERE ml_label IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tokens_deployer_outcome
+    ON tokens(deployer_wallet, outcome) WHERE deployer_wallet IS NOT NULL;
