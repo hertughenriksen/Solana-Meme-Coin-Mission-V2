@@ -17,14 +17,15 @@ impl Database {
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
+        // FIX: sqlx::migrate! requires filenames like "001_foo.sql" not "V99__foo.sql".
+        // The V99 migration was already applied manually via psql.
+        // Only run the numbered migrations here.
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!("Migrations applied");
         Ok(())
     }
 
     pub async fn insert_trade(&self, trade: &Trade) -> Result<()> {
-        // FIX: cast all DECIMAL/NUMERIC params to float8 so sqlx doesn't
-        // infer BigDecimal (which requires the optional "bigdecimal" feature).
         sqlx::query!(
             r#"INSERT INTO trades (
                 id, mint, strategy_track, status,
@@ -104,12 +105,10 @@ impl Database {
         let row = sqlx::query!(
             "SELECT rug_count FROM deployer_wallets WHERE wallet = $1", wallet
         ).fetch_optional(&self.pool).await?;
-        // FIX: rug_count is INTEGER → Option<i32> from sqlx; can't cast with `as u32` directly
         Ok(row.and_then(|r| r.rug_count).map(|n| n as u32))
     }
 
     pub async fn get_copy_wallet_winrate(&self, wallet: &str) -> Result<Option<f64>> {
-        // FIX: win_rate is DECIMAL → cast to float8 in SQL so sqlx returns f64
         let row = sqlx::query!(
             "SELECT win_rate::float8 AS win_rate FROM copy_wallets WHERE wallet = $1 AND is_active = true",
             wallet
@@ -117,9 +116,6 @@ impl Database {
         Ok(row.and_then(|r| r.win_rate))
     }
 
-    // ── Session stats ─────────────────────────────────────────────────────────
-    // FIX: every DECIMAL/NUMERIC expression cast to ::float8 so sqlx resolves
-    // them as f64 rather than requiring the bigdecimal optional feature.
     pub async fn get_session_stats(&self) -> Result<SessionStats> {
         let row = sqlx::query!(r#"
             SELECT
@@ -143,22 +139,21 @@ impl Database {
         let total = row.total_trades.unwrap_or(0) as u32;
         let wins  = row.winning_trades.unwrap_or(0) as u32;
         Ok(SessionStats {
-            total_trades:        total,
-            winning_trades:      wins,
-            losing_trades:       row.losing_trades.unwrap_or(0) as u32,
-            win_rate:            if total > 0 { wins as f64 / total as f64 } else { 0.0 },
-            total_pnl_sol:       row.total_pnl_sol.unwrap_or(0.0),
-            best_trade_pct:      row.best_trade_pct.unwrap_or(0.0),
-            worst_trade_pct:     row.worst_trade_pct.unwrap_or(0.0),
-            avg_hold_minutes:    row.avg_hold_minutes.unwrap_or(0.0),
-            open_positions:      row.open_positions.unwrap_or(0) as u32,
-            signals_scanned:     0,
+            total_trades:         total,
+            winning_trades:       wins,
+            losing_trades:        row.losing_trades.unwrap_or(0) as u32,
+            win_rate:             if total > 0 { wins as f64 / total as f64 } else { 0.0 },
+            total_pnl_sol:        row.total_pnl_sol.unwrap_or(0.0),
+            best_trade_pct:       row.best_trade_pct.unwrap_or(0.0),
+            worst_trade_pct:      row.worst_trade_pct.unwrap_or(0.0),
+            avg_hold_minutes:     row.avg_hold_minutes.unwrap_or(0.0),
+            open_positions:       row.open_positions.unwrap_or(0) as u32,
+            signals_scanned:      0,
             signals_filtered_out: 0,
-            jito_tips_paid_sol:  row.jito_tips.unwrap_or(0) as f64 / 1e9,
+            jito_tips_paid_sol:   row.jito_tips.unwrap_or(0) as f64 / 1e9,
         })
     }
 
-    // ── Training stats ────────────────────────────────────────────────────────
     pub async fn get_training_stats(&self) -> Result<TrainingStats> {
         let token_row = sqlx::query!(r#"
             SELECT
@@ -176,19 +171,24 @@ impl Database {
 
         let sig_row = sqlx::query!(r#"
             SELECT
-                COUNT(*)::bigint                                                AS total_signals,
-                COUNT(*) FILTER (WHERE source = 'twitter')::bigint             AS twitter,
-                COUNT(*) FILTER (WHERE source = 'telegram')::bigint            AS telegram,
-                COUNT(*) FILTER (WHERE source = 'yellowstone')::bigint         AS yellowstone,
-                COUNT(*) FILTER (WHERE source = 'copy_trade')::bigint          AS copy_trade
+                COUNT(*)::bigint                                               AS total_signals,
+                COUNT(*) FILTER (WHERE source = 'twitter')::bigint            AS twitter,
+                COUNT(*) FILTER (WHERE source = 'telegram')::bigint           AS telegram,
+                COUNT(*) FILTER (WHERE source = 'yellowstone')::bigint        AS yellowstone,
+                COUNT(*) FILTER (WHERE source = 'copy_trade')::bigint         AS copy_trade
             FROM signals
         "#).fetch_one(&self.pool).await?;
 
-        // FIX: training_sessions may not exist until migration 003 runs.
-        // Use query_unchecked! so we don't get a compile-time DB verification error.
-        let session_ts: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar_unchecked!(
+        // FIX: training_sessions may not exist at compile time (created by migration 003).
+        // Use sqlx::query_as with a raw pool query to skip macro-level DB verification.
+        // Also use a Result-ignoring fetch so it degrades gracefully if table is missing.
+        let session_ts: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>,)>(
             "SELECT started_at FROM training_sessions ORDER BY started_at ASC LIMIT 1"
-        ).fetch_optional(&self.pool).await.unwrap_or(None);
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .and_then(|opt| opt.map(|(ts,)| ts));
 
         let rej_rows = sqlx::query!(r#"
             SELECT
@@ -206,20 +206,20 @@ impl Database {
         let hours  = token_row.hours_of_data.unwrap_or(0.0);
 
         Ok(TrainingStats {
-            total_tokens:           total,
-            labeled_tokens:         token_row.labeled_tokens.unwrap_or(0),
-            positive_labels:        token_row.positive_labels.unwrap_or(0),
-            negative_labels:        token_row.negative_labels.unwrap_or(0),
-            hours_of_data:          hours,
-            collection_started_at:  session_ts,
-            total_signals:          sig_row.total_signals.unwrap_or(0),
-            twitter_signals:        sig_row.twitter.unwrap_or(0),
-            telegram_signals:       sig_row.telegram.unwrap_or(0),
-            yellowstone_signals:    sig_row.yellowstone.unwrap_or(0),
-            copy_trade_signals:     sig_row.copy_trade.unwrap_or(0),
-            tokens_passed_filter:   passed,
-            tokens_per_hour:        if hours > 0.0 { total as f64 / hours } else { 0.0 },
-            filter_pass_rate:       if total > 0 { passed as f64 / total as f64 } else { 0.0 },
+            total_tokens:          total,
+            labeled_tokens:        token_row.labeled_tokens.unwrap_or(0),
+            positive_labels:       token_row.positive_labels.unwrap_or(0),
+            negative_labels:       token_row.negative_labels.unwrap_or(0),
+            hours_of_data:         hours,
+            collection_started_at: session_ts,
+            total_signals:         sig_row.total_signals.unwrap_or(0),
+            twitter_signals:       sig_row.twitter.unwrap_or(0),
+            telegram_signals:      sig_row.telegram.unwrap_or(0),
+            yellowstone_signals:   sig_row.yellowstone.unwrap_or(0),
+            copy_trade_signals:    sig_row.copy_trade.unwrap_or(0),
+            tokens_passed_filter:  passed,
+            tokens_per_hour:       if hours > 0.0 { total as f64 / hours } else { 0.0 },
+            filter_pass_rate:      if total > 0 { passed as f64 / total as f64 } else { 0.0 },
             top_rejections: rej_rows.into_iter().map(|r| RejectionStat {
                 reason: r.reason.unwrap_or_default(),
                 count:  r.cnt.unwrap_or(0),
@@ -277,7 +277,6 @@ impl Database {
     }
 
     pub async fn insert_price_candle(&self, mint: &str, candle: &Candle) -> Result<()> {
-        // FIX: cast all DECIMAL params to float8
         sqlx::query!(
             r#"INSERT INTO price_candles_2s
                (mint, ts, open, high, low, close, volume, buy_count, sell_count)
@@ -297,12 +296,14 @@ impl Database {
     }
 
     pub async fn start_training_session(&self) -> Result<i32> {
-        // FIX: use query_unchecked! — training_sessions may not exist at compile
-        // time if migration 003 hasn't been verified by sqlx prepare yet.
-        let row: (i32,) = sqlx::query_as_unchecked!(
-            (i32,),
+        // FIX: use sqlx::query_as with a plain string (no macro) to avoid
+        // compile-time table verification — training_sessions is created by
+        // migration 003 which may not be present in the sqlx offline cache.
+        let row: (i32,) = sqlx::query_as::<_, (i32,)>(
             "INSERT INTO training_sessions (started_at) VALUES (NOW()) RETURNING id"
-        ).fetch_one(&self.pool).await?;
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0)
     }
 }
