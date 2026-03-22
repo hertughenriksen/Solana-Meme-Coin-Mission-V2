@@ -28,12 +28,14 @@ impl Database {
                 id, mint, strategy_track, status, entry_price_usd, entry_amount_sol,
                 ml_tabular_score, ml_transformer_score, ml_gnn_score, ml_nlp_score,
                 ml_ensemble_score, jito_tip_lamports, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ) VALUES ($1,$2,$3,$4,$5::FLOAT8,$6::FLOAT8,$7::FLOAT8,$8::FLOAT8,$9::FLOAT8,$10::FLOAT8,$11::FLOAT8,$12,$13)
             ON CONFLICT (id) DO NOTHING"#,
-            trade.id, trade.mint,
+            trade.id,
+            trade.mint,
             format!("{:?}", trade.strategy_track).to_lowercase(),
             format!("{:?}", trade.status).to_lowercase(),
-            trade.entry_price_usd, trade.entry_amount_sol,
+            trade.entry_price_usd,
+            trade.entry_amount_sol,
             trade.filter_result.tabular_score,
             trade.filter_result.transformer_score,
             trade.filter_result.gnn_score,
@@ -67,13 +69,16 @@ impl Database {
     pub async fn log_filter_result(&self, mint: &str, result: &FilterResult) -> Result<()> {
         sqlx::query!(
             r#"INSERT INTO tokens (mint, filter_passed, filter_rejection_reason, ml_ensemble_score)
-               VALUES ($1,$2,$3,$4)
+               VALUES ($1, $2, $3, $4::DECIMAL)
                ON CONFLICT (mint) DO UPDATE SET
-                 filter_passed = EXCLUDED.filter_passed,
-                 filter_rejection_reason = EXCLUDED.filter_rejection_reason,
-                 ml_ensemble_score = EXCLUDED.ml_ensemble_score,
-                 updated_at = NOW()"#,
-            mint, result.passed, result.rejection_reason.as_deref(), result.ensemble_score,
+                 filter_passed             = EXCLUDED.filter_passed,
+                 filter_rejection_reason   = EXCLUDED.filter_rejection_reason,
+                 ml_ensemble_score         = EXCLUDED.ml_ensemble_score,
+                 updated_at               = NOW()"#,
+            mint,
+            result.passed,
+            result.rejection_reason.as_deref(),
+            result.ensemble_score as f32,
         ).execute(&self.pool).await?;
         Ok(())
     }
@@ -87,7 +92,8 @@ impl Database {
 
     pub async fn get_copy_wallet_winrate(&self, wallet: &str) -> Result<Option<f64>> {
         let row = sqlx::query!(
-            "SELECT win_rate FROM copy_wallets WHERE wallet = $1 AND is_active = true", wallet
+            "SELECT win_rate::FLOAT8 AS win_rate FROM copy_wallets WHERE wallet = $1 AND is_active = true",
+            wallet
         ).fetch_optional(&self.pool).await?;
         Ok(row.and_then(|r| r.win_rate))
     }
@@ -95,15 +101,15 @@ impl Database {
     pub async fn get_session_stats(&self) -> Result<SessionStats> {
         let row = sqlx::query!(r#"
             SELECT
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) as winning_trades,
-                SUM(CASE WHEN pnl_sol <= 0 AND status='closed' THEN 1 ELSE 0 END) as losing_trades,
-                COALESCE(SUM(pnl_sol), 0.0) as total_pnl_sol,
-                COALESCE(MAX(pnl_pct), 0.0) as best_trade_pct,
-                COALESCE(MIN(pnl_pct), 0.0) as worst_trade_pct,
-                COALESCE(AVG(EXTRACT(EPOCH FROM (exited_at - entered_at))/60), 0.0) as avg_hold_minutes,
-                COUNT(*) FILTER (WHERE status IN ('confirmed','partial_exit')) as open_positions,
-                COALESCE(SUM(jito_tip_lamports), 0) as jito_tips
+                COUNT(*)::BIGINT                                                              AS total_trades,
+                SUM(CASE WHEN pnl_sol > 0  THEN 1 ELSE 0 END)::BIGINT                       AS winning_trades,
+                SUM(CASE WHEN pnl_sol <= 0 AND status='closed' THEN 1 ELSE 0 END)::BIGINT   AS losing_trades,
+                COALESCE(SUM(pnl_sol)::FLOAT8,  0.0)                                         AS total_pnl_sol,
+                COALESCE(MAX(pnl_pct)::FLOAT8,  0.0)                                         AS best_trade_pct,
+                COALESCE(MIN(pnl_pct)::FLOAT8,  0.0)                                         AS worst_trade_pct,
+                COALESCE(AVG(EXTRACT(EPOCH FROM (exited_at - entered_at))/60)::FLOAT8, 0.0)  AS avg_hold_minutes,
+                COUNT(*) FILTER (WHERE status IN ('confirmed','partial_exit'))::BIGINT        AS open_positions,
+                COALESCE(SUM(jito_tip_lamports)::BIGINT, 0)                                  AS jito_tips
             FROM trades
             WHERE created_at >= NOW() - INTERVAL '24 hours' AND status != 'cancelled'
         "#).fetch_one(&self.pool).await?;
@@ -111,18 +117,18 @@ impl Database {
         let total = row.total_trades.unwrap_or(0) as u32;
         let wins  = row.winning_trades.unwrap_or(0) as u32;
         Ok(SessionStats {
-            total_trades: total,
-            winning_trades: wins,
-            losing_trades: row.losing_trades.unwrap_or(0) as u32,
-            win_rate: if total > 0 { wins as f64 / total as f64 } else { 0.0 },
-            total_pnl_sol: row.total_pnl_sol.unwrap_or(0.0),
-            best_trade_pct: row.best_trade_pct.unwrap_or(0.0),
-            worst_trade_pct: row.worst_trade_pct.unwrap_or(0.0),
-            avg_hold_minutes: row.avg_hold_minutes.unwrap_or(0.0),
-            open_positions: row.open_positions.unwrap_or(0) as u32,
-            signals_scanned: 0,
+            total_trades:        total,
+            winning_trades:      wins,
+            losing_trades:       row.losing_trades.unwrap_or(0) as u32,
+            win_rate:            if total > 0 { wins as f64 / total as f64 } else { 0.0 },
+            total_pnl_sol:       row.total_pnl_sol.unwrap_or(0.0),
+            best_trade_pct:      row.best_trade_pct.unwrap_or(0.0),
+            worst_trade_pct:     row.worst_trade_pct.unwrap_or(0.0),
+            avg_hold_minutes:    row.avg_hold_minutes.unwrap_or(0.0),
+            open_positions:      row.open_positions.unwrap_or(0) as u32,
+            signals_scanned:     0,
             signals_filtered_out: 0,
-            jito_tips_paid_sol: row.jito_tips.unwrap_or(0) as f64 / 1e9,
+            jito_tips_paid_sol:  row.jito_tips.unwrap_or(0) as f64 / 1e9,
         })
     }
 

@@ -3,6 +3,7 @@ pub mod rpc_client;
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -272,7 +273,7 @@ impl ExecutionEngine {
 
         let message      = tx.message;
         let account_keys: Vec<solana_sdk::pubkey::Pubkey> = message.static_account_keys().to_vec();
-        let compute_prog = solana_sdk::pubkey::Pubkey::from_str(&COMPUTE_BUDGET_PROGRAM_ID, )?;
+        let compute_prog = solana_sdk::pubkey::Pubkey::from_str(COMPUTE_BUDGET_PROGRAM_ID)?;
 
         for ix in message.instructions() {
             let prog = account_keys.get(ix.program_id_index as usize).copied().unwrap_or_default();
@@ -422,5 +423,3 @@ impl ExecutionEngine {
         anyhow::bail!("Cannot decode Raydium AMM pool state for {}", pool_address)
     }
 }
-
-use std::str::FromStr as _;
