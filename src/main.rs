@@ -7,6 +7,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
 mod db;
+mod enrichment;
 mod scanner;
 mod signals;
 mod filter;
@@ -40,14 +41,14 @@ async fn main() -> Result<()> {
 
     info!("╔══════════════════════════════════════════╗");
     info!("║     SOLANA MEMECOIN BOT v0.1.0            ║");
-    info!("║     Starting all systems...               ║");
+    info!("║     DATA COLLECTION BUILD                 ║");
     info!("╚══════════════════════════════════════════╝");
 
     let config = Arc::new(BotConfig::load()?);
     info!("Config loaded | dry_run={}", config.bot.dry_run);
     if config.bot.dry_run {
-        warn!("⚠️  DRY RUN / TRAINING MODE — no real transactions will be sent");
-        info!("📊 Training dashboard: http://localhost:{}/training", config.monitor.dashboard_port);
+        warn!("DRY RUN / TRAINING MODE — no real transactions will be sent");
+        info!("Training dashboard: http://localhost:{}/training", config.monitor.dashboard_port);
     }
 
     info!("Connecting to PostgreSQL...");
@@ -57,10 +58,20 @@ async fn main() -> Result<()> {
     info!("Connecting to Redis...");
     let redis = Arc::new(RedisClient::connect(&config.database.redis_url).await?);
 
+    // ── Record this boot as a training session start ──────────────────────────
+    // This populates training_sessions table so the dashboard shows
+    // "collection started at" correctly.
+    if config.bot.dry_run {
+        match db.start_training_session().await {
+            Ok(id) => info!("Training session #{} started", id),
+            Err(e) => warn!("Could not record training session: {} (non-fatal)", e),
+        }
+    }
+
     info!("Loading ONNX model ensemble...");
     let models = Arc::new(ModelEnsemble::load(&config.models)?);
 
-    let (signal_tx, _signal_rx) = broadcast::channel::<TokenSignal>(1024);
+    let (signal_tx, _signal_rx) = broadcast::channel::<TokenSignal>(2048);
     let (trade_tx, trade_rx)    = mpsc::channel::<TradeDecision>(256);
 
     let filter = Arc::new(FilterPipeline::new(
@@ -74,18 +85,18 @@ async fn main() -> Result<()> {
     );
     let dashboard = Dashboard::new(config.clone(), db.clone(), redis.clone());
 
-    // ── Price feed ────────────────────────────────────────────────────────
-    let pf = PriceFeed::new(redis.clone());
+    // ── Price feed — now also writes candles to PostgreSQL ────────────────────
+    let pf = PriceFeed::new(redis.clone(), db.clone());
     tokio::spawn(async move { pf.run().await; });
-    info!("✅ Price feed started");
+    info!("Price feed started (Redis + PostgreSQL candle writes)");
 
-    // ── Signal sources ────────────────────────────────────────────────────
+    // ── Signal sources ────────────────────────────────────────────────────────
     let ys = YellowstoneScanner::new(config.clone(), signal_tx.clone());
     tokio::spawn(async move {
         loop {
             if let Err(e) = ys.run().await {
-                error!("Yellowstone error: {e} — reconnecting in 5s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                error!("Scanner error: {e} — reconnecting in 10s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             }
         }
     });
@@ -94,8 +105,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             if let Err(e) = tw.run().await {
-                error!("Twitter scanner error: {e} — reconnecting in 15s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                error!("Twitter scanner error: {e} — reconnecting in 30s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
         }
     });
@@ -104,8 +115,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             if let Err(e) = tg.run().await {
-                error!("Telegram scanner error: {e} — reconnecting in 10s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                error!("Telegram scanner error: {e} — reconnecting in 30s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
         }
     });
@@ -115,14 +126,14 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             loop {
                 if let Err(e) = wt.run().await {
-                    error!("Wallet tracker error: {e} — reconnecting in 5s");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    error!("Wallet tracker error: {e} — reconnecting in 10s");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
             }
         });
     }
 
-    // ── Strategy engine ───────────────────────────────────────────────────
+    // ── Strategy engine ───────────────────────────────────────────────────────
     let strat = strategy.clone();
     let mut sig_rx = signal_tx.subscribe();
     tokio::spawn(async move {
@@ -136,11 +147,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Execution engine ──────────────────────────────────────────────────
+    // ── Execution engine ──────────────────────────────────────────────────────
     let exec = execution.clone();
     tokio::spawn(async move { exec.run(trade_rx).await });
 
-    // ── Position manager ──────────────────────────────────────────────────
+    // ── Position manager ──────────────────────────────────────────────────────
     let strat_pm = strategy.clone();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(tokio::time::Duration::from_secs(2));
@@ -152,13 +163,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Weekly retraining ─────────────────────────────────────────────────
+    // ── Weekly retraining ─────────────────────────────────────────────────────
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             let now = chrono::Utc::now();
             if now.weekday() == chrono::Weekday::Sun && now.hour() == 2 {
-                info!("🔄 Starting scheduled model retraining...");
+                info!("Starting scheduled model retraining...");
                 if let Err(e) = models::retrain_models().await {
                     error!("Model retraining failed: {e}");
                 }
@@ -166,7 +177,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Dashboard ─────────────────────────────────────────────────────────
+    // ── Dashboard ─────────────────────────────────────────────────────────────
     info!("Starting dashboard on port {}...", config.monitor.dashboard_port);
     tokio::spawn(async move {
         if let Err(e) = dashboard.run().await {
@@ -174,10 +185,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("✅ All systems online");
-    info!("📊 Live dashboard:     http://localhost:{}", config.monitor.dashboard_port);
-    info!("🧠 Training dashboard: http://localhost:{}/training", config.monitor.dashboard_port);
+    info!("All systems online");
+    info!("Live dashboard:     http://localhost:{}", config.monitor.dashboard_port);
+    info!("Training dashboard: http://localhost:{}/training", config.monitor.dashboard_port);
 
+    // ── Health logging loop ───────────────────────────────────────────────────
     let db_stats    = db.clone();
     let redis_stats = redis.clone();
     let mut iv = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -186,12 +198,23 @@ async fn main() -> Result<()> {
         match db_stats.get_session_stats().await {
             Ok(stats) => {
                 let (scanned, filtered) = redis_stats.get_signal_counts().await.unwrap_or((0, 0));
-                info!(
-                    "📊 trades={} win={:.1}% pnl={:+.4}SOL open={} scanned={} pass_rate={:.1}%",
-                    stats.total_trades, stats.win_rate * 100.0, stats.total_pnl_sol,
-                    stats.open_positions, scanned,
-                    if scanned > 0 { (scanned - filtered) as f64 / scanned as f64 * 100.0 } else { 0.0 },
-                );
+                // During training, also log token collection progress
+                if config.bot.dry_run {
+                    if let Ok(ts) = db_stats.get_training_stats().await {
+                        info!(
+                            "COLLECTION | tokens={} labeled={} hours={:.1}h scanned={} pass={:.1}%",
+                            ts.total_tokens, ts.labeled_tokens, ts.hours_of_data,
+                            scanned,
+                            if scanned > 0 { (scanned - filtered) as f64 / scanned as f64 * 100.0 } else { 0.0 },
+                        );
+                    }
+                } else {
+                    info!(
+                        "trades={} win={:.1}% pnl={:+.4}SOL open={} scanned={}",
+                        stats.total_trades, stats.win_rate * 100.0, stats.total_pnl_sol,
+                        stats.open_positions, scanned,
+                    );
+                }
             }
             Err(e) => error!("Stats error: {e}"),
         }

@@ -1,3 +1,11 @@
+/// db/postgres.rs
+///
+/// DATA-COLLECTION BUILD additions:
+///   - write_token_detection()  — upserts a full token row with all
+///     on-chain fields populated at detection time so outcome_tracker
+///     can label it later.
+///   - write_price_candle()     — previously dead-code; now called by
+///     price_feed every 2 s so the model has candle history to train on.
 use anyhow::Result;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::info;
@@ -17,13 +25,114 @@ impl Database {
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
-        // FIX: sqlx::migrate! requires filenames like "001_foo.sql" not "V99__foo.sql".
-        // The V99 migration was already applied manually via psql.
-        // Only run the numbered migrations here.
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!("Migrations applied");
         Ok(())
     }
+
+    // ── Training-data write ───────────────────────────────────────────────────
+
+    /// Called immediately when a new token signal is detected.
+    /// Writes every available on-chain field so outcome_tracker.py
+    /// can later compute a label from price_candles_2s.
+    pub async fn write_token_detection(&self, signal: &TokenSignal) -> Result<()> {
+        let Some(ref d) = signal.on_chain else { return Ok(()); };
+        sqlx::query!(
+            r#"INSERT INTO tokens (
+                mint,
+                first_seen_at,
+                dex,
+                liquidity_usd,
+                market_cap_usd,
+                deployer_wallet,
+                mint_authority_disabled,
+                freeze_authority_disabled,
+                lp_locked,
+                lp_lock_days,
+                dev_holding_pct,
+                sniper_concentration_pct,
+                top_10_holder_pct,
+                liquidity_usd_at_detection,
+                market_cap_usd_at_detection,
+                sniper_concentration_pct,
+                dev_holding_pct,
+                lp_lock_days,
+                buy_sell_ratio_at_detection,
+                price_usd_at_detection,
+                updated_at
+            ) VALUES (
+                $1, $2, $3,
+                $4::float8, $5::float8, $6,
+                $7, $8, $9, $10,
+                $11::float8, $12::float8, $13::float8,
+                $4::float8, $5::float8,
+                $12::float8, $11::float8, $10,
+                $14::float8, $15::float8,
+                NOW()
+            )
+            ON CONFLICT (mint) DO UPDATE SET
+                liquidity_usd                  = EXCLUDED.liquidity_usd,
+                market_cap_usd                 = EXCLUDED.market_cap_usd,
+                liquidity_usd_at_detection     = EXCLUDED.liquidity_usd_at_detection,
+                market_cap_usd_at_detection    = EXCLUDED.market_cap_usd_at_detection,
+                price_usd_at_detection         = EXCLUDED.price_usd_at_detection,
+                buy_sell_ratio_at_detection    = EXCLUDED.buy_sell_ratio_at_detection,
+                sniper_concentration_pct       = EXCLUDED.sniper_concentration_pct,
+                dev_holding_pct                = EXCLUDED.dev_holding_pct,
+                lp_lock_days                   = EXCLUDED.lp_lock_days,
+                deployer_wallet                = EXCLUDED.deployer_wallet,
+                mint_authority_disabled        = EXCLUDED.mint_authority_disabled,
+                freeze_authority_disabled      = EXCLUDED.freeze_authority_disabled,
+                lp_locked                      = EXCLUDED.lp_locked,
+                updated_at                     = NOW()
+            WHERE tokens.price_usd_at_detection IS NULL
+               OR tokens.price_usd_at_detection = 0"#,
+            signal.mint,
+            signal.detected_at,
+            format!("{:?}", d.dex).to_lowercase(),
+            d.liquidity_usd,
+            d.market_cap_usd,
+            d.deployer_wallet,
+            d.mint_authority_disabled,
+            d.freeze_authority_disabled,
+            d.lp_locked,
+            d.lp_lock_days.map(|v| v as i32),
+            d.dev_holding_pct,
+            d.sniper_concentration_pct,
+            d.top_10_holder_pct,
+            // buy_sell_ratio_at_detection
+            if (d.buy_count_1h + d.sell_count_1h) > 0 {
+                d.buy_count_1h as f64 / (d.buy_count_1h + d.sell_count_1h) as f64
+            } else { 0.5 },
+            d.price_usd,
+        ).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Write a single 2-second price candle for a token.
+    /// This was previously #[allow(dead_code)] and never called.
+    /// Now called by PriceFeed::tick() for every open position + SOL.
+    pub async fn write_price_candle(&self, mint: &str, candle: &Candle) -> Result<()> {
+        sqlx::query!(
+            r#"INSERT INTO price_candles_2s
+               (mint, ts, open, high, low, close, volume, buy_count, sell_count)
+               VALUES ($1, $2, $3::float8, $4::float8, $5::float8, $6::float8,
+                       $7::float8, $8, $9)
+               ON CONFLICT DO NOTHING"#,
+            mint,
+            candle.timestamp,
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume,
+            candle.buy_count as i32,
+            candle.sell_count as i32,
+        ).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ── Existing methods (unchanged) ─────────────────────────────────────────
 
     pub async fn insert_trade(&self, trade: &Trade) -> Result<()> {
         sqlx::query!(
@@ -108,15 +217,6 @@ impl Database {
         Ok(row.and_then(|r| r.rug_count).map(|n| n as u32))
     }
 
-    #[allow(dead_code)]
-    pub async fn get_copy_wallet_winrate(&self, wallet: &str) -> Result<Option<f64>> {
-        let row = sqlx::query!(
-            "SELECT win_rate::float8 AS win_rate FROM copy_wallets WHERE wallet = $1 AND is_active = true",
-            wallet
-        ).fetch_optional(&self.pool).await?;
-        Ok(row.and_then(|r| r.win_rate))
-    }
-
     pub async fn get_session_stats(&self) -> Result<SessionStats> {
         let row = sqlx::query!(r#"
             SELECT
@@ -180,9 +280,6 @@ impl Database {
             FROM signals
         "#).fetch_one(&self.pool).await?;
 
-        // FIX: training_sessions may not exist at compile time (created by migration 003).
-        // Use sqlx::query_as with a raw pool query to skip macro-level DB verification.
-        // Also use a Result-ignoring fetch so it degrades gracefully if table is missing.
         let session_ts: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>,)>(
             "SELECT started_at FROM training_sessions ORDER BY started_at ASC LIMIT 1"
         )
@@ -247,17 +344,6 @@ impl Database {
         Ok(count)
     }
 
-    #[allow(dead_code)]
-    pub async fn count_recent_losses(&self, hours: u32) -> Result<i64> {
-        let row = sqlx::query!(
-            r#"SELECT COUNT(*)::bigint AS cnt FROM trades
-               WHERE status='closed' AND pnl_sol < 0
-               AND created_at >= NOW() - MAKE_INTERVAL(hours => $1)"#,
-            hours as i32,
-        ).fetch_one(&self.pool).await?;
-        Ok(row.cnt.unwrap_or(0))
-    }
-
     pub async fn log_signal(&self, signal: &TokenSignal, passed: bool, rejection: Option<&str>) -> Result<()> {
         let source_wallet: Option<&str> = signal.copy_trade.as_ref().map(|ct| ct.source_wallet.as_str());
         sqlx::query!(
@@ -278,35 +364,32 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn insert_price_candle(&self, mint: &str, candle: &Candle) -> Result<()> {
-        sqlx::query!(
-            r#"INSERT INTO price_candles_2s
-               (mint, ts, open, high, low, close, volume, buy_count, sell_count)
-               VALUES ($1,$2,$3::float8,$4::float8,$5::float8,$6::float8,$7::float8,$8,$9)
-               ON CONFLICT DO NOTHING"#,
-            mint,
-            candle.timestamp,
-            candle.open,
-            candle.high,
-            candle.low,
-            candle.close,
-            candle.volume,
-            candle.buy_count as i32,
-            candle.sell_count as i32,
-        ).execute(&self.pool).await?;
-        Ok(())
-    }
-
     pub async fn start_training_session(&self) -> Result<i32> {
-        // FIX: use sqlx::query_as with a plain string (no macro) to avoid
-        // compile-time table verification — training_sessions is created by
-        // migration 003 which may not be present in the sqlx offline cache.
         let row: (i32,) = sqlx::query_as::<_, (i32,)>(
             "INSERT INTO training_sessions (started_at) VALUES (NOW()) RETURNING id"
         )
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_copy_wallet_winrate(&self, wallet: &str) -> Result<Option<f64>> {
+        let row = sqlx::query!(
+            "SELECT win_rate::float8 AS win_rate FROM copy_wallets WHERE wallet = $1 AND is_active = true",
+            wallet
+        ).fetch_optional(&self.pool).await?;
+        Ok(row.and_then(|r| r.win_rate))
+    }
+
+    #[allow(dead_code)]
+    pub async fn count_recent_losses(&self, hours: u32) -> Result<i64> {
+        let row = sqlx::query!(
+            r#"SELECT COUNT(*)::bigint AS cnt FROM trades
+               WHERE status='closed' AND pnl_sol < 0
+               AND created_at >= NOW() - MAKE_INTERVAL(hours => $1)"#,
+            hours as i32,
+        ).fetch_one(&self.pool).await?;
+        Ok(row.cnt.unwrap_or(0))
     }
 }

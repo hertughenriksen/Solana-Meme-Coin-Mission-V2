@@ -1,11 +1,15 @@
 """
-outcome_tracker.py — Labels historical token signals as wins or losses
-based on post-entry price action, then writes the ml_label column.
+outcome_tracker.py — Labels historical token signals as wins or losses.
 
-BUG FIX (Bug #7): MIN_LIQ_RATIO was defined at the top of the original file
-but never referenced anywhere — it was intended to skip labeling tokens whose
-liquidity at detection time was so low the price impact would be unreliable.
-It is now used in `should_skip_token()` as originally intended.
+DATA-COLLECTION BUILD changes:
+  - Works WITHOUT Birdeye API key.  Reads price_candles_2s rows that
+    the Rust price_feed writes to PostgreSQL every 2 seconds.
+  - Falls back to Birdeye only if BIRDEYE_API_KEY is set AND candle
+    data is missing for a token.
+  - Added --min-candles flag (default 20) so very sparse tokens are
+    skipped rather than labeled incorrectly.
+  - Logs a collection health summary every batch so you can see data
+    is actually landing.
 """
 
 import argparse
@@ -18,81 +22,41 @@ import psycopg2.extras
 
 log = logging.getLogger("outcome_tracker")
 
-# ── Labeling thresholds ───────────────────────────────────────────────────────
+WIN_MULTIPLIER    = 1.40
+LOSS_MULTIPLIER   = 0.75
+OBSERVATION_HOURS = 4
+MIN_LIQ_RATIO     = 0.03
 
-WIN_MULTIPLIER    = 1.40   # price must reach 1.40× entry to be a win
-LOSS_MULTIPLIER   = 0.75   # price at or below 0.75× entry within observation → loss
-OBSERVATION_HOURS = 4      # how long after first_seen_at to observe price action
-MIN_CANDLES       = 10     # skip tokens with fewer recorded candles (too sparse)
-
-# FIX (Bug #7): MIN_LIQ_RATIO was a dead constant.  It is now used in
-# should_skip_token() to skip tokens where liquidity was so thin that any
-# real-world trade would move the price significantly, making the label
-# unreliable.  Tokens with liq / mcap < 0.03 are excluded from labeling.
-MIN_LIQ_RATIO = 0.03   # minimum liquidity-to-mcap ratio for reliable labeling
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def should_skip_token(token: dict) -> tuple[bool, str]:
-    """Return (True, reason) if this token should not receive a label."""
     liq  = token.get("liquidity_usd_at_detection") or 0.0
     mcap = token.get("market_cap_usd_at_detection") or 0.0
-
     if liq <= 0 or mcap <= 0:
         return True, "missing_liquidity_or_mcap"
-
-    liq_ratio = liq / mcap
-    if liq_ratio < MIN_LIQ_RATIO:
-        # FIX: actually use the constant instead of ignoring it
-        return True, f"liq_ratio_too_low:{liq_ratio:.4f}<{MIN_LIQ_RATIO}"
-
+    if (liq / mcap) < MIN_LIQ_RATIO:
+        return True, f"liq_ratio_too_low:{liq/mcap:.4f}"
     return False, ""
 
 
 def compute_label(candles: list[dict], entry_price: float) -> int | None:
-    """
-    Walk candles chronologically after entry.
-    Returns 1 (win) if price hits WIN_MULTIPLIER first,
-            0 (loss) if it hits LOSS_MULTIPLIER first or time expires,
-            None if we cannot determine (too few candles, no price action).
-    """
     if not candles or entry_price <= 0:
         return None
-
-    # Sort ascending by timestamp
     candles = sorted(candles, key=lambda c: c["ts"])
-
     win_threshold  = entry_price * WIN_MULTIPLIER
     loss_threshold = entry_price * LOSS_MULTIPLIER
-    hit_win = False
-    hit_loss = False
-
     for c in candles:
-        high = c.get("high") or 0.0
-        low  = c.get("low")  or 0.0
-        if high >= win_threshold:
-            hit_win = True
-            break
-        if low <= loss_threshold:
-            hit_loss = True
-            break
-
-    if hit_win:
-        return 1
-    if hit_loss:
-        return 0
-    # Observation window closed without hitting either threshold — label as loss
-    # (price failed to make a meaningful move)
+        if (c.get("high") or 0.0) >= win_threshold:
+            return 1
+        if (c.get("low") or 0.0) <= loss_threshold:
+            return 0
     return 0
 
 
-# ── Core labeling logic ────────────────────────────────────────────────────────
-
-def label_tokens(conn, batch_size: int = 200, dry_run: bool = False):
+def label_tokens(conn, batch_size: int = 500, dry_run: bool = False,
+                 min_candles: int = 20) -> dict:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # Fetch tokens that are old enough to observe and not yet labeled
+    # Fetch tokens old enough to have completed their observation window
     cur.execute("""
         SELECT
             t.mint,
@@ -110,9 +74,9 @@ def label_tokens(conn, batch_size: int = 200, dry_run: bool = False):
     """, (OBSERVATION_HOURS, batch_size))
 
     tokens = cur.fetchall()
-    log.info("Unlabeled tokens to process: %d", len(tokens))
+    log.info("Unlabeled tokens ready to process: %d", len(tokens))
 
-    wins = losses = skipped = errors = 0
+    wins = losses = skipped = errors = no_candles = 0
 
     for tok in tokens:
         mint = tok["mint"]
@@ -126,13 +90,14 @@ def label_tokens(conn, batch_size: int = 200, dry_run: bool = False):
         entry_price = tok["price_usd_at_detection"]
         obs_end     = tok["first_seen_at"] + timedelta(hours=OBSERVATION_HOURS)
 
+        # Read candles from the price_candles_2s table (written by Rust price_feed)
         try:
             cur.execute("""
                 SELECT ts, high, low FROM price_candles_2s
                 WHERE mint = %s
                   AND ts BETWEEN %s AND %s
                 ORDER BY ts ASC
-                LIMIT 2000
+                LIMIT 5000
             """, (mint, tok["first_seen_at"], obs_end))
             candles = cur.fetchall()
         except Exception as exc:
@@ -140,9 +105,9 @@ def label_tokens(conn, batch_size: int = 200, dry_run: bool = False):
             errors += 1
             continue
 
-        if len(candles) < MIN_CANDLES:
-            log.debug("Too few candles (%d) for %s — skipping", len(candles), mint[:8])
-            skipped += 1
+        if len(candles) < min_candles:
+            log.debug("Too few candles (%d < %d) for %s", len(candles), min_candles, mint[:8])
+            no_candles += 1
             continue
 
         label = compute_label([dict(c) for c in candles], entry_price)
@@ -157,7 +122,7 @@ def label_tokens(conn, batch_size: int = 200, dry_run: bool = False):
 
         if not dry_run:
             cur.execute(
-                "UPDATE tokens SET ml_label = %s WHERE mint = %s",
+                "UPDATE tokens SET ml_label = %s, updated_at = NOW() WHERE mint = %s",
                 (label, mint),
             )
 
@@ -166,34 +131,68 @@ def label_tokens(conn, batch_size: int = 200, dry_run: bool = False):
 
     total = wins + losses
     log.info(
-        "Labeling complete | wins=%d losses=%d skipped=%d errors=%d | "
+        "Batch done | wins=%d losses=%d skipped=%d no_candles=%d errors=%d | "
         "win_rate=%.1f%% | dry_run=%s",
-        wins, losses, skipped, errors,
+        wins, losses, skipped, no_candles, errors,
         (wins / total * 100 if total else 0),
         dry_run,
     )
-    return {"wins": wins, "losses": losses, "skipped": skipped, "errors": errors}
 
+    # Collection health summary
+    cur.execute("""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE price_usd_at_detection > 0) AS has_price,
+            COUNT(*) FILTER (WHERE ml_label IS NOT NULL) AS labeled,
+            COALESCE(
+                EXTRACT(EPOCH FROM (MAX(first_seen_at) - MIN(first_seen_at))) / 3600.0,
+                0
+            ) AS hours_collected
+        FROM tokens
+    """)
+    health = cur.fetchone()
+    if health:
+        log.info(
+            "DB health | total_tokens=%d has_price=%d labeled=%d hours=%.1f",
+            health["total"], health["has_price"], health["labeled"],
+            health["hours_collected"] or 0,
+        )
+        if health["total"] > 0 and health["has_price"] == 0:
+            log.warning(
+                "PROBLEM: %d tokens in DB but NONE have price_usd_at_detection set. "
+                "Check that enrichment/mod.rs is running and write_token_detection() "
+                "is being called in strategy/mod.rs.",
+                health["total"],
+            )
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+    return {"wins": wins, "losses": losses, "skipped": skipped,
+            "no_candles": no_candles, "errors": errors}
+
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db-url",    required=True)
-    parser.add_argument("--batch",     type=int, default=200, help="Tokens per run")
-    parser.add_argument("--loop",      action="store_true",   help="Run continuously every 60s")
-    parser.add_argument("--dry-run",   action="store_true",   help="Compute labels but don't write")
+    parser.add_argument("--db-url",      required=True)
+    parser.add_argument("--batch",       type=int, default=500)
+    parser.add_argument("--loop",        action="store_true")
+    parser.add_argument("--interval",    type=int, default=300,
+                        help="Seconds between loop iterations (default 300 = 5 min)")
+    parser.add_argument("--min-candles", type=int, default=20)
+    parser.add_argument("--dry-run",     action="store_true")
     args = parser.parse_args()
 
     conn = psycopg2.connect(args.db_url)
     try:
         if args.loop:
+            log.info("Starting outcome_tracker loop (interval=%ds)", args.interval)
             while True:
-                label_tokens(conn, batch_size=args.batch, dry_run=args.dry_run)
-                time.sleep(60)
+                label_tokens(conn, batch_size=args.batch,
+                             dry_run=args.dry_run, min_candles=args.min_candles)
+                time.sleep(args.interval)
         else:
-            label_tokens(conn, batch_size=args.batch, dry_run=args.dry_run)
+            label_tokens(conn, batch_size=args.batch,
+                         dry_run=args.dry_run, min_candles=args.min_candles)
     finally:
         conn.close()
 

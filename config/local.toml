@@ -1,0 +1,150 @@
+# config/local.toml — DATA COLLECTION BUILD
+# Copy this file to config/local.toml and fill in YOUR_* values.
+# These settings are optimised for 2-week dry-run data collection
+# using only free APIs.  Tighten everything back before going live.
+
+[bot]
+name                      = "alpha-bot-training"
+dry_run                   = true          # NEVER change this during collection
+log_level                 = "info"
+max_trades_per_hour       = 500           # no real limit during dry run
+trading_window_start_utc  = 0             # collect 24/7
+trading_window_end_utc    = 24
+
+[wallet]
+keypair_path              = "./secrets/keypair.json"
+max_total_capital_sol     = 0.0           # zero — no capital at risk in dry run
+max_position_size_sol     = 0.0
+max_concurrent_positions  = 50            # allow many simulated positions
+reserve_sol               = 0.0
+
+[rpc]
+# Required: sign up free at https://helius.dev
+helius_api_key            = "YOUR_HELIUS_API_KEY"
+helius_rpc_url            = "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+helius_ws_url             = "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+
+# Leave empty — triggers the free Helius RPC polling path in scanner/mod.rs
+yellowstone_grpc_url      = ""
+yellowstone_grpc_token    = ""
+
+# Optional extras — leave as-is if you don't have them
+quicknode_url             = ""
+quicknode_ws_url          = ""
+shyft_api_key             = ""
+
+[jito]
+block_engines = [
+    "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+]
+auth_keypair_path     = "./secrets/jito_keypair.json"
+tip_percentile_target = 75
+tip_min_lamports      = 10000
+tip_max_lamports      = 5000000
+tip_profit_share      = 0.50
+tip_account           = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"
+
+[bloxroute]
+enabled     = false
+auth_header = ""
+endpoint    = ""
+
+[nozomi]
+enabled  = false
+api_key  = ""
+endpoint = ""
+
+[database]
+postgres_url         = "postgresql://bot:password@localhost:5432/memecoin_bot"
+redis_url            = "redis://localhost:6379"
+pool_max_connections = 20
+
+[signals.twitter]
+# Leave bearer_token empty — Twitter scanner will self-disable (needs paid plan)
+bearer_token              = ""
+kol_accounts              = []
+trigger_keywords          = ["CA:", "contract:", "just launched", "new gem", "100x",
+                              "pump.fun", "lp locked", "based dev", "rugged", "avoid",
+                              "rug", "honeypot", "moonshot", "degen", "lfg"]
+min_kol_followers         = 1000
+sentiment_score_threshold = 0.40
+
+[signals.telegram]
+# Leave api_id empty — Telegram scanner self-disables (grammers not stable)
+api_id   = ""
+api_hash = ""
+phone    = ""
+groups   = []
+min_message_velocity = 2
+
+# ── Filter — VERY loose during data collection ────────────────────────────────
+# Goal: let almost everything through so the DB gets both winners AND losers.
+# Rejected tokens become the negative class for ML training.
+# The ML model can only learn if it sees both sides of the boundary.
+[filter]
+min_liquidity_usd                = 5000        # catch micro-caps
+max_liquidity_usd                = 20000000    # very wide
+min_market_cap_usd               = 5000
+max_market_cap_usd               = 20000000
+max_token_age_hours              = 336         # 2 weeks
+min_buy_count_24h                = 5           # near zero — we estimate anyway
+min_sell_count_24h               = 2
+max_dev_holding_pct              = 0.50        # let ruggers through — they are training data
+max_sniper_concentration_pct     = 0.50
+min_win_probability              = 0.20        # heuristic returns ~0.5; let nearly all through
+min_sentiment_score              = 0.20
+require_mint_authority_disabled  = false       # do NOT filter on this during training
+require_freeze_authority_disabled = false
+min_lp_lock_days                 = 0
+max_creator_rug_history          = 999         # intentionally wide
+max_price_impact_5pct_sell       = 0.99
+
+[strategy]
+snipe_entry_1_pct        = 0.30
+snipe_entry_2_delay_secs = 30
+snipe_entry_2_pct        = 0.30
+snipe_entry_3_delay_secs = 90
+snipe_entry_3_pct        = 0.40
+tp_1_multiplier          = 1.4
+tp_1_sell_pct            = 0.30
+tp_2_multiplier          = 2.0
+tp_2_sell_pct            = 0.30
+tp_3_trailing_stop_pct   = 0.25
+hard_stop_loss_pct        = 0.20
+time_stop_minutes         = 60
+max_daily_loss_sol        = 0.0               # irrelevant in dry run
+circuit_breaker_consecutive_losses = 999      # disable during training
+circuit_breaker_pause_minutes      = 1
+copy_trade_enabled        = false
+copy_wallets              = []
+copy_max_buy_sol          = 0.0
+copy_wallet_min_winrate   = 0.0
+
+[execution]
+skip_preflight         = true
+commitment             = "processed"
+max_retries            = 3
+retry_delay_ms         = 500
+slippage_start_bps     = 500
+slippage_max_bps       = 2000
+slippage_increment_bps = 300
+
+[models]
+tabular_model_path     = "./ml/models/catboost.onnx"
+transformer_model_path = "./ml/models/price_transformer.onnx"
+gnn_model_path         = "./ml/models/wallet_gnn.onnx"
+nlp_model_path         = "./ml/models/sentiment_finbert.onnx"
+tabular_weight         = 0.30
+transformer_weight     = 0.25
+gnn_weight             = 0.30
+nlp_weight             = 0.15
+ensemble_threshold     = 0.80
+retrain_cron           = "0 2 * * 0"
+
+[monitor]
+prometheus_port          = 9090
+dashboard_port           = 8080
+alert_webhook_url        = ""     # optional Discord webhook
+alert_on_trade           = false
+alert_on_loss_pct        = 0.15
+alert_on_circuit_breaker = false

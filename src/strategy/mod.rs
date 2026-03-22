@@ -1,3 +1,11 @@
+/// strategy/mod.rs
+///
+/// DATA-COLLECTION BUILD change:
+///   process_signal() now calls db.write_token_detection() BEFORE the
+///   filter runs.  This guarantees every token the scanner finds is
+///   persisted to the tokens table with price_usd_at_detection set,
+///   even tokens that later fail the filter.  Those rejected rows are
+///   the negative-class training examples the ML models need.
 use anyhow::Result;
 use chrono::Timelike;
 use std::sync::Arc;
@@ -30,6 +38,20 @@ impl StrategyEngine {
     pub async fn process_signal(&self, signal: TokenSignal) -> Result<()> {
         let _ = self.redis.increment_signals_scanned().await;
 
+        // ── TRAINING DATA: persist token to DB BEFORE filtering ───────────────
+        // This ensures every detected token has a row with price_usd_at_detection
+        // so outcome_tracker.py can label it.  Failures are non-fatal.
+        {
+            let db  = self.db.clone();
+            let sig = signal.clone();
+            tokio::spawn(async move {
+                if let Err(e) = db.write_token_detection(&sig).await {
+                    debug!("write_token_detection failed for {}: {}", &sig.mint[..8.min(sig.mint.len())], e);
+                }
+            });
+        }
+
+        // ── Gate checks (circuit breaker, trading window, limits) ────────────
         if self.is_circuit_broken().await? {
             debug!("Circuit breaker active — skipping {}", &signal.mint[..signal.mint.len().min(8)]);
             return Ok(());
@@ -59,8 +81,10 @@ impl StrategyEngine {
             return Ok(());
         }
 
+        // ── Filter ────────────────────────────────────────────────────────────
         let fr = self.filter.evaluate(&signal).await?;
 
+        // Log signal with filter outcome (also updates tokens.filter_passed)
         {
             let db       = self.db.clone();
             let sig_log  = signal.clone();
@@ -72,11 +96,13 @@ impl StrategyEngine {
         }
 
         if !fr.passed {
-            debug!("❌ {} rejected: {}", &signal.mint[..signal.mint.len().min(8)],
+            debug!("❌ {} rejected: {}",
+                   &signal.mint[..signal.mint.len().min(8)],
                    fr.rejection_reason.as_deref().unwrap_or("?"));
             return Ok(());
         }
 
+        // ── Build trade decision ──────────────────────────────────────────────
         let decision = match signal.signal_type {
             SignalType::SmartWalletBuy =>
                 self.build_copy_decision(signal, fr, available).await?,
@@ -98,8 +124,8 @@ impl StrategyEngine {
     }
 
     async fn build_snipe_decision(&self, signal: TokenSignal, fr: FilterResult, available: f64) -> Result<TradeDecision> {
-        let cfg    = &self.config.strategy;
-        let size   = self.kelly_size(fr.win_probability, available);
+        let cfg     = &self.config.strategy;
+        let size    = self.kelly_size(fr.win_probability, available);
         let entry_1 = size * cfg.snipe_entry_1_pct;
         Ok(TradeDecision {
             id: Uuid::new_v4(), signal, filter_result: fr,
@@ -215,20 +241,8 @@ impl StrategyEngine {
         Ok(())
     }
 
-    /// FIX (Bug #5): do NOT call `redis.remove_open_position` here.
-    ///
-    /// The original code removed the position from Redis immediately after
-    /// sending the sell to the trade channel.  Because the channel is async,
-    /// the execution engine may not have processed the sell yet — the position
-    /// disappeared from Redis while the tokens were still held.
-    ///
-    /// The execution engine already calls `redis.remove_open_position` after a
-    /// successful sell bundle when `sell_pct >= 1.0` (see `execute_sell`).
-    /// Removing it here was both redundant and ordered incorrectly.
     async fn fire_full_exit(&self, pos: &Trade, pnl_pct: f64) -> Result<()> {
         self.fire_partial_sell(pos, 1.0).await?;
-        // Position removal is now handled inside execute_sell after the sell
-        // bundle is accepted — not here.
         let track = format!("{:?}", pos.strategy_track).to_lowercase();
         record_trade_exited(pnl_pct, &track);
         Ok(())
@@ -270,7 +284,7 @@ impl StrategyEngine {
         let cfg = &self.config.strategy;
         if consecutive >= cfg.circuit_breaker_consecutive_losses as i64 {
             warn!(
-                "⚡ Circuit breaker: {} consecutive losses — pausing {}min",
+                "Circuit breaker: {} consecutive losses — pausing {}min",
                 consecutive, cfg.circuit_breaker_pause_minutes,
             );
             self.redis.set_circuit_breaker_active(cfg.circuit_breaker_pause_minutes * 60).await?;
