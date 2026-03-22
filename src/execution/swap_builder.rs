@@ -15,6 +15,7 @@ use spl_associated_token_account::get_associated_token_address;
 use std::str::FromStr;
 
 pub const PUMP_FUN_PROGRAM_ID:         &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+#[allow(dead_code)]
 pub const PUMP_SWAP_PROGRAM_ID:        &str = "pSwapMdSai8tjrEXcxFeQth87xC4rRsa4Ka5Sw4UDCZ";
 pub const RAYDIUM_CPMM_PROGRAM_ID:     &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 pub const RAYDIUM_AMM_PROGRAM_ID:      &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -131,10 +132,16 @@ pub fn derive_pump_fun_bonding_curve(mint: &Pubkey) -> (Pubkey, u8) {
 pub struct RaydiumCpmmSwapArgs { pub amount_in: u64, pub minimum_amount_out: u64 }
 
 pub struct CpmmPoolAccounts {
-    pub pool_id: Pubkey, pub pool_authority: Pubkey, pub pool_state: Pubkey,
+    #[allow(dead_code)]
+    pub pool_id: Pubkey, 
+    #[allow(dead_code)]
+    pub pool_authority: Pubkey, 
+    pub pool_state: Pubkey,
     pub token0_mint: Pubkey, pub token1_mint: Pubkey,
     pub token0_vault: Pubkey, pub token1_vault: Pubkey,
-    pub lp_mint: Pubkey, pub observation_key: Pubkey,
+    #[allow(dead_code)]
+    pub lp_mint: Pubkey, 
+    pub observation_key: Pubkey,
 }
 
 pub fn build_raydium_cpmm_swap(
@@ -229,6 +236,7 @@ pub fn apply_slippage(expected_out: u64, slippage_bps: u32) -> u64 {
     expected_out.saturating_sub((expected_out * slippage_bps as u64) / 10_000)
 }
 
+#[allow(dead_code)]
 pub fn estimate_price_impact_cpmm(reserve_in: u64, reserve_out: u64, amount_in: u64) -> f64 {
     if reserve_in == 0 || reserve_out == 0 { return 1.0; }
     let amount_out = (amount_in as u128 * reserve_out as u128)
@@ -268,6 +276,7 @@ pub fn unwrap_wsol_instruction(user: &Pubkey) -> Result<Instruction> {
     })
 }
 
+#[allow(dead_code)]
 pub fn create_ata_idempotent(user: &Pubkey, mint: &Pubkey, token_2022: bool) -> Result<Instruction> {
     let prog = Pubkey::from_str(if token_2022 { TOKEN_2022_PROGRAM_ID } else { TOKEN_PROGRAM_ID })?;
     Ok(spl_associated_token_account::instruction::create_associated_token_account_idempotent(

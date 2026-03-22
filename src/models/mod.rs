@@ -17,6 +17,7 @@ const NODE_DIM:    usize = 12;
 const MAX_NLP_LEN: usize = 128;
 
 pub struct ModelEnsemble {
+    #[allow(dead_code)]
     config:      ModelsConfig,
     tabular:     Option<Arc<Mutex<Session>>>,
     transformer: Option<Arc<Mutex<Session>>>,

@@ -108,6 +108,7 @@ impl Database {
         Ok(row.and_then(|r| r.rug_count).map(|n| n as u32))
     }
 
+    #[allow(dead_code)]
     pub async fn get_copy_wallet_winrate(&self, wallet: &str) -> Result<Option<f64>> {
         let row = sqlx::query!(
             "SELECT win_rate::float8 AS win_rate FROM copy_wallets WHERE wallet = $1 AND is_active = true",
@@ -246,6 +247,7 @@ impl Database {
         Ok(count)
     }
 
+    #[allow(dead_code)]
     pub async fn count_recent_losses(&self, hours: u32) -> Result<i64> {
         let row = sqlx::query!(
             r#"SELECT COUNT(*)::bigint AS cnt FROM trades
@@ -276,6 +278,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn insert_price_candle(&self, mint: &str, candle: &Candle) -> Result<()> {
         sqlx::query!(
             r#"INSERT INTO price_candles_2s

@@ -97,6 +97,7 @@ impl SolanaRpcClient {
         Ok(amount.parse::<u64>().unwrap_or(0))
     }
 
+    #[allow(dead_code)]
     pub async fn get_sol_balance(&self, address: &str) -> Result<u64> {
         let body = json!({
             "jsonrpc": "2.0", "id": 1,
@@ -107,6 +108,7 @@ impl SolanaRpcClient {
         Ok(resp["result"]["value"].as_u64().unwrap_or(0))
     }
 
+    #[allow(dead_code)]
     pub async fn confirm_transaction(&self, signature: &str, timeout_secs: u64) -> Result<bool> {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         while Instant::now() < deadline {
@@ -147,6 +149,7 @@ impl SolanaRpcClient {
         Ok(list)
     }
 
+    #[allow(dead_code)]
     pub async fn get_asset_info(&self, mint: &str) -> Result<Value> {
         let url = format!(
             "https://mainnet.helius-rpc.com/?api-key={}",
@@ -159,6 +162,7 @@ impl SolanaRpcClient {
         })).await
     }
 
+    #[allow(dead_code)]
     pub async fn get_token_largest_accounts(&self, mint: &str) -> Result<Vec<(String, u64)>> {
         let body = json!({
             "jsonrpc": "2.0", "id": 1,
