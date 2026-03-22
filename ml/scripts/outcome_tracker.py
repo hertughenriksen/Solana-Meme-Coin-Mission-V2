@@ -75,20 +75,35 @@ async def compute_label(session, mint, launch_time):
     return 0, "survived_no_pump", peak_mult
 
 async def update_wallet_stats(conn):
+    """Update win-rate stats for copy-trade wallets.
+
+    FIX: the original query referenced a non-existent 'source_wallet' column on
+    the trades table.  We now join through signals.source_wallet which is
+    populated by the Rust bot when it logs copy-trade signals (migration 002).
+    """
     await conn.execute("""
-        UPDATE copy_wallets cw SET
+        UPDATE copy_wallets cw
+        SET
             total_trades   = s.total,
             winning_trades = s.wins,
-            win_rate       = CASE WHEN s.total > 0 THEN s.wins::decimal/s.total ELSE 0 END,
+            win_rate       = CASE WHEN s.total > 0
+                                  THEN s.wins::decimal / s.total
+                                  ELSE 0
+                             END,
             updated_at     = NOW()
         FROM (
-            SELECT source_wallet,
-                   COUNT(*) AS total,
-                   SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) AS wins
-            FROM trades
-            JOIN signals sg ON sg.mint = trades.mint AND sg.source = 'copy_trade'
-            GROUP BY source_wallet
-        ) s WHERE cw.wallet = s.source_wallet
+            SELECT
+                sg.source_wallet,
+                COUNT(tr.id)                                        AS total,
+                SUM(CASE WHEN tr.pnl_sol > 0 THEN 1 ELSE 0 END)   AS wins
+            FROM   signals sg
+            JOIN   trades  tr ON tr.mint = sg.mint
+            WHERE  sg.source        = 'copy_trade'
+              AND  sg.source_wallet IS NOT NULL
+              AND  tr.status        = 'closed'
+            GROUP  BY sg.source_wallet
+        ) s
+        WHERE cw.wallet = s.source_wallet
     """)
 
 if __name__ == '__main__':

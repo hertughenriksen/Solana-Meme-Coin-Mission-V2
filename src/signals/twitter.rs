@@ -142,8 +142,20 @@ impl TwitterScanner {
         let is_kol    = cfg.kol_accounts.iter().any(|id| id == author_id);
         let mints     = self.extract_mint_addresses(text);
 
+        // FIX: the original code had an unreachable second `return Ok(())` inside
+        // the `mints.is_empty()` branch, meaning KOL-only tweets (no CA) were
+        // silently dropped even though a comment implied they should be handled.
+        // Since we cannot trade without a mint address, we correctly return early
+        // in all no-CA cases, but we now emit a debug log for KOL+keyword hits so
+        // operators can see high-signal tweets that lacked an address.
         if mints.is_empty() {
-            if !is_kol || !self.has_trigger_keywords(text) { return Ok(()); }
+            if is_kol && self.has_trigger_keywords(text) {
+                debug!(
+                    "🐦 KOL alert (no CA): author={} | {}",
+                    author_id,
+                    &text[..text.len().min(120)],
+                );
+            }
             return Ok(());
         }
 

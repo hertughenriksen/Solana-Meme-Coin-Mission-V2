@@ -58,13 +58,20 @@ impl ModelEnsemble {
 
     /// Heuristic based on deployer age and sniper concentration.
     /// Replaced by the real ONNX GNN after `train_gnn.py` runs.
+    ///
+    /// FIX: the original filtered only on `TokenOutcome::Rug`.  With the
+    /// expanded TokenOutcome enum, Honeypot and FakePump are also negative
+    /// outcomes that should penalise a deployer's score.  Now uses the
+    /// `TokenOutcome::is_negative()` helper so any future additions are
+    /// automatically included.
     pub async fn score_gnn(&self, signal: &TokenSignal) -> Result<f64> {
         let score = signal.on_chain.as_ref().map(|d| {
             let age_score      = (d.deployer_wallet_age_days as f64 / 365.0).min(1.0) * 0.4;
             let sniper_penalty = d.sniper_concentration_pct * 2.0;
-            let rug_penalty    = d.deployer_previous_tokens.iter()
-                .filter(|t| t.outcome == TokenOutcome::Rug)
-                .count() as f64 * 0.2;
+            let bad_token_count = d.deployer_previous_tokens.iter()
+                .filter(|t| t.outcome.is_negative())
+                .count() as f64;
+            let rug_penalty = bad_token_count * 0.2;
             (0.6 + age_score - sniper_penalty - rug_penalty).clamp(0.0, 1.0)
         }).unwrap_or(0.5);
         Ok(score)

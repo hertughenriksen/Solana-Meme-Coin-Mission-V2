@@ -69,8 +69,40 @@ pub struct PreviousToken {
     pub peak_multiplier: f64,
 }
 
+/// FIX: added all outcome strings that `outcome_tracker.py` can write to the DB.
+/// The original enum only had 5 variants; Rust would panic when deserializing
+/// any token whose outcome was "pump", "fake_pump", "dump", etc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum TokenOutcome { Rug, Honeypot, Inactive, Survived, Graduated }
+#[serde(rename_all = "snake_case")]
+pub enum TokenOutcome {
+    // Original variants
+    Rug,
+    Honeypot,
+    Inactive,
+    Survived,
+    Graduated,
+    // Added — match Python labeler output strings exactly
+    Pump,
+    FakePump,
+    Dump,
+    SurvivedNoPump,
+    DataUnavailable,
+    Invalid,
+}
+
+impl TokenOutcome {
+    /// Returns true for any outcome that indicates the deployer acted badly.
+    /// Used by the GNN heuristic to penalise wallets with a history of bad launches.
+    pub fn is_negative(&self) -> bool {
+        matches!(
+            self,
+            TokenOutcome::Rug
+                | TokenOutcome::Honeypot
+                | TokenOutcome::FakePump
+                | TokenOutcome::Dump
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DexType {

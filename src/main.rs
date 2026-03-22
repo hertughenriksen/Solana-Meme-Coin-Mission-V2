@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Datelike, Timelike}; // required for .weekday() and .hour() on DateTime
+use chrono::{Datelike, Timelike};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
@@ -14,6 +14,7 @@ mod strategy;
 mod execution;
 mod models;
 mod monitor;
+mod price_feed; // FIX: new module — polls Jupiter and keeps Redis price cache warm
 mod types;
 
 use config::BotConfig;
@@ -25,6 +26,7 @@ use strategy::StrategyEngine;
 use execution::ExecutionEngine;
 use models::ModelEnsemble;
 use monitor::Dashboard;
+use price_feed::PriceFeed;
 use types::{TokenSignal, TradeDecision};
 
 #[tokio::main]
@@ -70,6 +72,16 @@ async fn main() -> Result<()> {
         ExecutionEngine::new(config.clone(), db.clone(), redis.clone()).await?,
     );
     let dashboard = Dashboard::new(config.clone(), db.clone(), redis.clone());
+
+    // ── Price feed (FIX: was missing — position manager needs live prices) ──
+    // Polls Jupiter every 2 s for all open positions + SOL/USD rate.
+    // Without this, get_cached_price() always returns None and every TP/SL
+    // check in manage_positions() silently skips.
+    let pf = PriceFeed::new(redis.clone());
+    tokio::spawn(async move {
+        pf.run().await;
+    });
+    info!("✅ Price feed started");
 
     // ── Signal sources ────────────────────────────────────────────────────
     let ys = YellowstoneScanner::new(config.clone(), signal_tx.clone());
@@ -149,7 +161,6 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             let now = chrono::Utc::now();
-            // Datelike::weekday() and Timelike::hour() brought in at top of file
             if now.weekday() == chrono::Weekday::Sun && now.hour() == 2 {
                 info!("🔄 Starting scheduled model retraining...");
                 if let Err(e) = models::retrain_models().await {

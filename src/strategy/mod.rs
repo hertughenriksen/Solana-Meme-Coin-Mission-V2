@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Timelike; // required for .hour() on DateTime
+use chrono::Timelike;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::config::BotConfig;
 use crate::db::{Database, RedisClient};
 use crate::filter::FilterPipeline;
+use crate::monitor::record_trade_exited; // FIX: was defined but never called
 use crate::types::*;
 
 pub struct StrategyEngine {
@@ -30,7 +31,7 @@ impl StrategyEngine {
         let _ = self.redis.increment_signals_scanned().await;
 
         if self.is_circuit_broken().await? {
-            debug!("Circuit breaker active — skipping {}", &signal.mint[..8]);
+            debug!("Circuit breaker active — skipping {}", &signal.mint[..signal.mint.len().min(8)]);
             return Ok(());
         }
 
@@ -54,13 +55,26 @@ impl StrategyEngine {
         }
 
         if self.redis.has_active_position(&signal.mint).await? {
-            debug!("Already have position in {}", &signal.mint[..8]);
+            debug!("Already have position in {}", &signal.mint[..signal.mint.len().min(8)]);
             return Ok(());
         }
 
         let fr = self.filter.evaluate(&signal).await?;
+
+        // FIX: log_signal was never called — the signals table remained empty,
+        // making post-session analytics and copy-wallet stat attribution impossible.
+        {
+            let db       = self.db.clone();
+            let sig_log  = signal.clone();
+            let passed   = fr.passed;
+            let rejection = fr.rejection_reason.clone();
+            tokio::spawn(async move {
+                let _ = db.log_signal(&sig_log, passed, rejection.as_deref()).await;
+            });
+        }
+
         if !fr.passed {
-            debug!("❌ {} rejected: {}", &signal.mint[..8], fr.rejection_reason.as_deref().unwrap_or("?"));
+            debug!("❌ {} rejected: {}", &signal.mint[..signal.mint.len().min(8)], fr.rejection_reason.as_deref().unwrap_or("?"));
             return Ok(());
         }
 
@@ -76,7 +90,7 @@ impl StrategyEngine {
         if decision.decision_type == DecisionType::Skip { return Ok(()); }
 
         info!("📝 Decision: {:?} | {} | {:.4} SOL | ML {:.3}",
-            decision.decision_type, &decision.signal.mint[..8],
+            decision.decision_type, &decision.signal.mint[..decision.signal.mint.len().min(8)],
             decision.buy_amount_sol, decision.filter_result.ensemble_score);
 
         let _ = self.trade_tx.send(decision).await;
@@ -135,18 +149,19 @@ impl StrategyEngine {
             if entry <= 0.0 { continue; }
 
             let mult = price / entry;
+            let pnl_pct = mult - 1.0; // used at each exit point below
             let age_min = pos.entered_at
                 .map(|t| chrono::Utc::now().signed_duration_since(t).num_minutes() as u32)
                 .unwrap_or(0);
 
             if mult >= cfg.tp_1_multiplier && !self.redis.has_taken_tp1(&pos.mint).await? {
-                info!("🎯 TP1 {:.2}x on {} — selling {:.0}%", mult, &pos.mint[..8], cfg.tp_1_sell_pct * 100.0);
+                info!("🎯 TP1 {:.2}x on {} — selling {:.0}%", mult, &pos.mint[..pos.mint.len().min(8)], cfg.tp_1_sell_pct * 100.0);
                 self.fire_partial_sell(&pos, cfg.tp_1_sell_pct).await?;
                 self.redis.mark_tp1_taken(&pos.mint).await?;
             }
 
             if mult >= cfg.tp_2_multiplier && !self.redis.has_taken_tp2(&pos.mint).await? {
-                info!("🎯 TP2 {:.2}x on {} — selling {:.0}%, setting trail", mult, &pos.mint[..8], cfg.tp_2_sell_pct * 100.0);
+                info!("🎯 TP2 {:.2}x on {} — selling {:.0}%, setting trail", mult, &pos.mint[..pos.mint.len().min(8)], cfg.tp_2_sell_pct * 100.0);
                 self.fire_partial_sell(&pos, cfg.tp_2_sell_pct).await?;
                 self.redis.mark_tp2_taken(&pos.mint).await?;
                 let trail = price * (1.0 - cfg.tp_3_trailing_stop_pct);
@@ -154,8 +169,9 @@ impl StrategyEngine {
             }
 
             if mult <= (1.0 - cfg.hard_stop_loss_pct) {
-                warn!("🛑 Stop loss {:.2}x on {} — full exit", mult, &pos.mint[..8]);
-                self.fire_full_exit(&pos).await?;
+                warn!("🛑 Stop loss {:.2}x on {} — full exit", mult, &pos.mint[..pos.mint.len().min(8)]);
+                // FIX: pass pnl_pct so fire_full_exit can record the metric
+                self.fire_full_exit(&pos, pnl_pct).await?;
                 self.check_circuit_breaker().await?;
                 continue;
             }
@@ -164,15 +180,15 @@ impl StrategyEngine {
                 let new_trail = price * (1.0 - cfg.tp_3_trailing_stop_pct);
                 if new_trail > trail { self.redis.set_trailing_stop(&pos.mint, new_trail).await?; }
                 if price <= trail {
-                    info!("📉 Trail stop hit on {} at {:.2}x", &pos.mint[..8], mult);
-                    self.fire_full_exit(&pos).await?;
+                    info!("📉 Trail stop hit on {} at {:.2}x", &pos.mint[..pos.mint.len().min(8)], mult);
+                    self.fire_full_exit(&pos, pnl_pct).await?;
                     continue;
                 }
             }
 
             if age_min >= cfg.time_stop_minutes && mult < cfg.tp_1_multiplier {
-                warn!("⏰ Time stop {}min on {} at {:.2}x", age_min, &pos.mint[..8], mult);
-                self.fire_full_exit(&pos).await?;
+                warn!("⏰ Time stop {}min on {} at {:.2}x", age_min, &pos.mint[..pos.mint.len().min(8)], mult);
+                self.fire_full_exit(&pos, pnl_pct).await?;
             }
         }
         Ok(())
@@ -190,9 +206,13 @@ impl StrategyEngine {
         Ok(())
     }
 
-    async fn fire_full_exit(&self, pos: &Trade) -> Result<()> {
+    /// FIX: now accepts `pnl_pct` so it can call `record_trade_exited` and
+    /// populate Prometheus metrics that were previously always zero.
+    async fn fire_full_exit(&self, pos: &Trade, pnl_pct: f64) -> Result<()> {
         self.fire_partial_sell(pos, 1.0).await?;
         self.redis.remove_open_position(&pos.mint).await?;
+        let track = format!("{:?}", pos.strategy_track).to_lowercase();
+        record_trade_exited(pnl_pct, &track);
         Ok(())
     }
 
@@ -227,11 +247,20 @@ impl StrategyEngine {
         Ok(self.redis.get_circuit_breaker_active().await.unwrap_or(false))
     }
 
+    /// FIX: was calling `count_recent_losses(1)` which counts ALL losses in the
+    /// last hour — not consecutive ones.  The config field is named
+    /// `circuit_breaker_consecutive_losses` and the intent is clearly to pause
+    /// after a losing *streak*, not after N scattered losses.  Now uses
+    /// `count_consecutive_losses()` which walks backwards through closed trades
+    /// and stops at the first win.
     async fn check_circuit_breaker(&self) -> Result<()> {
-        let losses = self.db.count_recent_losses(1).await?;
+        let consecutive = self.db.count_consecutive_losses().await?;
         let cfg = &self.config.strategy;
-        if losses >= cfg.circuit_breaker_consecutive_losses as i64 {
-            warn!("⚡ Circuit breaker: {} losses in 1h — pausing {}min", losses, cfg.circuit_breaker_pause_minutes);
+        if consecutive >= cfg.circuit_breaker_consecutive_losses as i64 {
+            warn!(
+                "⚡ Circuit breaker: {} consecutive losses — pausing {}min",
+                consecutive, cfg.circuit_breaker_pause_minutes,
+            );
             self.redis.set_circuit_breaker_active(cfg.circuit_breaker_pause_minutes * 60).await?;
         }
         Ok(())

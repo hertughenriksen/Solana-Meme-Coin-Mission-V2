@@ -117,16 +117,25 @@ impl RedisClient {
         let v: Option<String> = c.get("congestion:multiplier").await.unwrap_or(None);
         Ok(v.and_then(|s| s.parse().ok()).unwrap_or(1.0))
     }
+
     pub async fn get_cached_price(&self, mint: &str) -> Option<f64> {
         let mut c = self.conn.clone();
         c.get::<_, String>(format!("price:{}", mint)).await.ok()
             .and_then(|s| s.parse().ok())
     }
+
+    /// FIX: TTL raised from 2 s to 10 s.
+    /// The price feed polls every 2 s; a 2 s TTL caused a race condition where
+    /// the key could expire just before position management read it, making
+    /// every price read return None and disabling all TP/SL logic.
+    /// A 10 s TTL is still short enough to stay fresh while being resilient
+    /// to a single missed poll cycle.
     pub async fn set_cached_price(&self, mint: &str, price: f64) -> Result<()> {
         let mut c = self.conn.clone();
-        let _: () = c.set_ex(format!("price:{}", mint), price.to_string(), 2).await?;
+        let _: () = c.set_ex(format!("price:{}", mint), price.to_string(), 10).await?;
         Ok(())
     }
+
     pub async fn increment_signals_scanned(&self) -> Result<u64> {
         let mut c = self.conn.clone();
         Ok(c.incr("signals:scanned", 1u64).await.unwrap_or(0))

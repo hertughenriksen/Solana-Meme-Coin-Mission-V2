@@ -126,6 +126,32 @@ impl Database {
         })
     }
 
+    /// FIX: replaces the old `count_recent_losses(hours)` call in the circuit
+    /// breaker.  The config field is named `circuit_breaker_consecutive_losses`
+    /// but the previous implementation counted ALL losses in the last hour,
+    /// not consecutive ones.  This method fetches the 10 most-recent closed
+    /// trades in order and counts how many form an unbroken losing streak at
+    /// the head of that list.
+    pub async fn count_consecutive_losses(&self) -> Result<i64> {
+        let rows = sqlx::query!(
+            r#"SELECT pnl_sol::float8 AS pnl_sol
+               FROM trades
+               WHERE status = 'closed' AND exited_at IS NOT NULL
+               ORDER BY exited_at DESC
+               LIMIT 10"#
+        ).fetch_all(&self.pool).await?;
+
+        let mut count = 0i64;
+        for row in rows {
+            match row.pnl_sol {
+                Some(pnl) if pnl < 0.0 => count += 1,
+                _ => break, // streak broken by a win or null
+            }
+        }
+        Ok(count)
+    }
+
+    /// Kept for compatibility; circuit breaker now uses count_consecutive_losses.
     pub async fn count_recent_losses(&self, hours: u32) -> Result<i64> {
         let row = sqlx::query!(
             "SELECT COUNT(*) as cnt FROM trades WHERE status='closed' AND pnl_sol < 0
@@ -135,14 +161,29 @@ impl Database {
         Ok(row.cnt.unwrap_or(0))
     }
 
+    /// FIX: now also persists `source_wallet` extracted from `CopyTradeData`
+    /// so that outcome_tracker.py can attribute wins/losses back to the
+    /// originating copy-trade wallet.
     pub async fn log_signal(&self, signal: &TokenSignal, passed: bool, rejection: Option<&str>) -> Result<()> {
+        let source_wallet: Option<&str> = signal
+            .copy_trade
+            .as_ref()
+            .map(|ct| ct.source_wallet.as_str());
+
         sqlx::query!(
-            r#"INSERT INTO signals (id, mint, source, signal_type, detected_at, filter_passed, filter_rejection)
-               VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING"#,
-            signal.id, signal.mint,
+            r#"INSERT INTO signals
+                   (id, mint, source, signal_type, detected_at,
+                    filter_passed, filter_rejection, source_wallet)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               ON CONFLICT DO NOTHING"#,
+            signal.id,
+            signal.mint,
             format!("{:?}", signal.source).to_lowercase(),
             format!("{:?}", signal.signal_type).to_lowercase(),
-            signal.detected_at, passed, rejection,
+            signal.detected_at,
+            passed,
+            rejection,
+            source_wallet,
         ).execute(&self.pool).await?;
         Ok(())
     }

@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::config::BotConfig;
 use crate::db::{Database, RedisClient};
+use crate::monitor::record_trade_entered; // FIX: was defined but never called
 use crate::types::*;
 use rpc_client::SolanaRpcClient;
 use swap_builder::*;
@@ -63,18 +64,23 @@ impl ExecutionEngine {
 
     async fn execute_buy(&self, decision: TradeDecision) -> Result<()> {
         let mint = &decision.signal.mint;
+        let mint_short = &mint[..mint.len().min(8)]; // FIX: was `&mint[..8]` — bounds-safe
 
         if self.config.bot.dry_run {
-            info!("🧪 DRY BUY  {} | {:.4} SOL | ML {:.2}", &mint[..8], decision.buy_amount_sol, decision.filter_result.ensemble_score);
+            info!("🧪 DRY BUY  {} | {:.4} SOL | ML {:.2}", mint_short, decision.buy_amount_sol, decision.filter_result.ensemble_score);
+            // FIX: record_trade_entered was never called — Prometheus metrics were always zero
+            let track = format!("{:?}", decision.strategy_track).to_lowercase();
+            record_trade_entered(&track, decision.buy_amount_sol);
             self.db.log_dry_run_trade(&decision).await?;
             return Ok(());
         }
 
         if decision.entry_delay_seconds > 0 {
-            debug!("Delaying {}s before entering {}", decision.entry_delay_seconds, &mint[..8]);
+            debug!("Delaying {}s before entering {}", decision.entry_delay_seconds, mint_short);
             tokio::time::sleep(Duration::from_secs(decision.entry_delay_seconds as u64)).await;
+            // FIX: has_price_dumped was a permanent stub; now reads live Redis price
             if self.has_price_dumped(mint, 0.15).await? {
-                warn!("⛔ {} dumped during entry delay — skipping", &mint[..8]);
+                warn!("⛔ {} dumped during entry delay — skipping", mint_short);
                 return Ok(());
             }
         }
@@ -95,14 +101,17 @@ impl ExecutionEngine {
             all_ixs.push(unwrap_wsol_instruction(&self.keypair.pubkey())?);
         }
 
-        let compute_ixs = vec![set_compute_unit_limit(300_000), set_compute_unit_price(self.micro_lamports_per_cu())];
+        // FIX: micro_lamports_per_cu is now async and uses the Redis congestion multiplier
+        let cu_price = self.micro_lamports_per_cu().await;
+        let compute_ixs = vec![set_compute_unit_limit(300_000), set_compute_unit_price(cu_price)];
         let final_ixs = [compute_ixs, all_ixs].concat();
 
         let tip_lamports = self.calculate_tip(decision.buy_amount_sol).await;
         let blockhash    = self.rpc.get_latest_blockhash().await?;
         let bundle       = self.build_jito_bundle(final_ixs, tip_lamports, blockhash).await?;
 
-        info!("🚀 BUY {} | {:.4} SOL | tip {} lamports | via {} engines", &mint[..8], decision.buy_amount_sol, tip_lamports, self.config.jito.block_engines.len());
+        info!("🚀 BUY {} | {:.4} SOL | tip {} lamports | via {} engines",
+            mint_short, decision.buy_amount_sol, tip_lamports, self.config.jito.block_engines.len());
 
         let results      = self.submit_bundle_parallel(&bundle).await;
         let any_accepted = results.iter().any(|r| r.is_ok());
@@ -115,9 +124,13 @@ impl ExecutionEngine {
         }
 
         if !any_accepted {
-            warn!("Bundle rejected by all engines for {} — retrying with higher slippage", &mint[..8]);
+            warn!("Bundle rejected by all engines for {} — retrying with higher slippage", mint_short);
             return self.retry_with_higher_slippage(decision).await;
         }
+
+        // FIX: record_trade_entered was never called in the live path either
+        let track = format!("{:?}", decision.strategy_track).to_lowercase();
+        record_trade_entered(&track, decision.buy_amount_sol);
 
         let trade = Trade {
             id: decision.id, mint: mint.clone(),
@@ -148,14 +161,15 @@ impl ExecutionEngine {
 
     async fn execute_sell(&self, decision: TradeDecision, sell_pct: f64) -> Result<()> {
         let mint = &decision.signal.mint;
+        let mint_short = &mint[..mint.len().min(8)]; // FIX: bounds-safe
 
         if self.config.bot.dry_run {
-            info!("🧪 DRY SELL {:.0}% of {}", sell_pct * 100.0, &mint[..8]);
+            info!("🧪 DRY SELL {:.0}% of {}", sell_pct * 100.0, mint_short);
             return Ok(());
         }
 
         let token_balance = self.rpc.get_token_balance(&self.keypair.pubkey().to_string(), mint).await.unwrap_or(0);
-        if token_balance == 0 { warn!("No token balance to sell for {}", &mint[..8]); return Ok(()); }
+        if token_balance == 0 { warn!("No token balance to sell for {}", mint_short); return Ok(()); }
 
         let sell_amount = (token_balance as f64 * sell_pct) as u64;
         if sell_amount == 0 { return Ok(()); }
@@ -163,7 +177,9 @@ impl ExecutionEngine {
         let on_chain = decision.signal.on_chain.as_ref().context("No on-chain data for sell")?;
         let sell_ix  = self.build_sell_instruction(mint, on_chain, sell_amount, decision.max_slippage_bps).await?;
 
-        let mut all_ixs = vec![set_compute_unit_limit(250_000), set_compute_unit_price(self.micro_lamports_per_cu()), sell_ix];
+        // FIX: micro_lamports_per_cu is now async
+        let cu_price = self.micro_lamports_per_cu().await;
+        let mut all_ixs = vec![set_compute_unit_limit(250_000), set_compute_unit_price(cu_price), sell_ix];
         if matches!(on_chain.dex, DexType::RaydiumCPMM | DexType::RaydiumAMM) {
             all_ixs.push(unwrap_wsol_instruction(&self.keypair.pubkey())?);
         }
@@ -174,10 +190,10 @@ impl ExecutionEngine {
         let results      = self.submit_bundle_parallel(&bundle).await;
 
         if results.iter().any(|r| r.is_ok()) {
-            info!("🔴 SELL {:.0}% of {} submitted", sell_pct * 100.0, &mint[..8]);
+            info!("🔴 SELL {:.0}% of {} submitted", sell_pct * 100.0, mint_short);
             if sell_pct >= 1.0 { self.redis.remove_open_position(mint).await?; }
         } else {
-            error!("Sell bundle failed for {} — will retry next position-manager tick", &mint[..8]);
+            error!("Sell bundle failed for {} — will retry next position-manager tick", mint_short);
         }
         Ok(())
     }
@@ -346,6 +362,7 @@ impl ExecutionEngine {
     async fn retry_with_higher_slippage(&self, mut decision: TradeDecision) -> Result<()> {
         let max_slippage = self.config.execution.slippage_max_bps;
         let increment    = self.config.execution.slippage_increment_bps;
+        let mint_short   = &decision.signal.mint[..decision.signal.mint.len().min(8)]; // FIX: bounds-safe
         for attempt in 1..=self.config.execution.max_retries {
             let new_slippage = (decision.max_slippage_bps + increment * attempt).min(max_slippage);
             decision.max_slippage_bps = new_slippage;
@@ -355,19 +372,21 @@ impl ExecutionEngine {
                 if let Ok(swap_ix) = self.build_buy_instruction(&decision.signal.mint, on_chain, sol_lamports, new_slippage).await {
                     let blockhash = self.rpc.get_latest_blockhash().await?;
                     let tip       = self.calculate_tip(decision.buy_amount_sol).await;
+                    // FIX: micro_lamports_per_cu is now async
+                    let cu_price  = self.micro_lamports_per_cu().await;
                     let bundle    = self.build_jito_bundle(
-                        vec![set_compute_unit_limit(300_000), set_compute_unit_price(self.micro_lamports_per_cu()), swap_ix],
+                        vec![set_compute_unit_limit(300_000), set_compute_unit_price(cu_price), swap_ix],
                         tip, blockhash,
                     ).await?;
                     let results = self.submit_bundle_parallel(&bundle).await;
                     if results.iter().any(|r| r.is_ok()) {
-                        info!("✅ Retry {} succeeded for {}", attempt, &decision.signal.mint[..8]);
+                        info!("✅ Retry {} succeeded for {}", attempt, mint_short);
                         return Ok(());
                     }
                 }
             }
         }
-        warn!("All retries exhausted for {}", &decision.signal.mint[..8]);
+        warn!("All retries exhausted for {}", mint_short);
         Ok(())
     }
 
@@ -379,11 +398,36 @@ impl ExecutionEngine {
         ((base_tip as f64 * multiplier) as u64).clamp(cfg.tip_min_lamports, cfg.tip_max_lamports)
     }
 
-    fn micro_lamports_per_cu(&self) -> u64 { 5_000 }
+    /// FIX: was a hard-coded constant (5_000).  Now async so it can read the
+    /// network congestion multiplier from Redis and scale the priority fee
+    /// accordingly.  All three call sites were updated to `.await` this.
+    async fn micro_lamports_per_cu(&self) -> u64 {
+        let multiplier = self.redis.get_network_congestion_multiplier().await.unwrap_or(1.0);
+        (5_000.0 * multiplier) as u64
+    }
 
-    /// Stub — always returns false until price-feed integration is wired up.
-    async fn has_price_dumped(&self, _mint: &str, _threshold: f64) -> Result<bool> { Ok(false) }
+    /// FIX: was a permanent stub returning `false`.
+    /// Now reads the live price from Redis (written by price_feed every 2 s)
+    /// and compares it against the position's recorded entry price.
+    /// Returns false (safe to proceed) if no price data is available.
+    async fn has_price_dumped(&self, mint: &str, threshold: f64) -> Result<bool> {
+        let current = match self.redis.get_cached_price(mint).await {
+            Some(p) => p,
+            None    => return Ok(false), // price feed not yet warmed up — proceed
+        };
+        let positions = self.redis.get_all_open_positions().await?;
+        if let Some(pos) = positions.iter().find(|p| p.mint == mint) {
+            if pos.entry_price_usd > 0.0 {
+                let drop_fraction = 1.0 - (current / pos.entry_price_usd);
+                return Ok(drop_fraction >= threshold);
+            }
+        }
+        Ok(false)
+    }
 
+    /// Returns the current SOL/USD rate from Redis (written by price_feed).
+    /// Falls back to 160.0 only during the first few seconds before the feed
+    /// has written its first value.
     async fn get_sol_price_usd(&self) -> f64 {
         self.redis.get_cached_price("SOL").await.unwrap_or(160.0)
     }
