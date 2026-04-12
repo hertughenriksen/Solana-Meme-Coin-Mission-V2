@@ -14,7 +14,6 @@ import time
 from datetime import timedelta
 
 import psycopg2
-import psycopg2.extras
 
 log = logging.getLogger("outcome_tracker")
 
